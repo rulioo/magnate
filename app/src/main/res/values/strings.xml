@@ -1,0 +1,10 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <!--
+      界面文案为中文单语，绝大部分直接写在 Compose 中（design-gui.md 的文案即为最终稿）。
+      此处只保留清单与系统需要引用的资源。
+      「仅中文还是中英双语」在 design.md §14.9 仍是待确认问题，
+      若将来要双语化，需要把这些 Compose 内联文案统一抽到 strings.xml。
+    -->
+    <string name="app_name">磁测罗盘</string>
+</resources>

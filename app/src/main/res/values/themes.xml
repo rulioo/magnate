@@ -1,0 +1,13 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <!--
+      应用完全由 Compose 绘制，这里只需要一个无 ActionBar 的宿主主题。
+      刻意不继承 Material Components 的 XML 主题，以免为一个空壳引入该依赖（design.md §4「依赖原则」）。
+    -->
+    <style name="Theme.Magnate" parent="@android:style/Theme.Material.NoActionBar">
+        <item name="android:windowBackground">@color/magnate_window_background</item>
+        <item name="android:statusBarColor">@android:color/transparent</item>
+        <item name="android:navigationBarColor">@android:color/transparent</item>
+        <item name="android:windowLightStatusBar">false</item>
+    </style>
+</resources>

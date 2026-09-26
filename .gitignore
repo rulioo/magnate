@@ -1,0 +1,30 @@
+# —— Gradle ——
+.gradle/
+build/
+
+# —— Kotlin 增量编译缓存 ——
+.kotlin/
+
+# —— 本机 Android SDK 路径 ——
+# 该文件与机器绑定，本身也在注释里写明了不应纳入版本控制
+local.properties
+
+# —— IDE ——
+.idea/
+*.iml
+captures/
+.externalNativeBuild/
+.cxx/
+
+# —— 构建产物 ——
+# 二进制产物不进版本库：每次构建都会变，进了历史就再也删不干净。
+# dist/ 里放的是分发给测试用的 APK，需要时用 `git add -f dist/xxx.apk` 单独加。
+*.apk
+*.aab
+*.ap_
+*.dex
+dist/
+
+# —— 系统 ——
+.DS_Store
+Thumbs.db

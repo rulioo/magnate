@@ -1,0 +1,5 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <!-- 深色为默认主题（design-gui.md §12.1） -->
+    <color name="magnate_window_background">#121212</color>
+</resources>

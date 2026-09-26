@@ -1,0 +1,10 @@
+<?xml version="1.0" encoding="utf-8"?>
+<full-backup-content>
+    <!-- 记录与场景是用户手工积累的资产，随系统备份一起保留 -->
+    <include
+        domain="database"
+        path="." />
+    <include
+        domain="sharedpref"
+        path="." />
+</full-backup-content>

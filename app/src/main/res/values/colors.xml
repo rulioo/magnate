@@ -1,0 +1,6 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <!-- 浅色主题下的窗口底色，与 design-gui.md §12.1 的 background 一致 -->
+    <color name="magnate_window_background">#FAFAFA</color>
+    <color name="ic_launcher_background">#121212</color>
+</resources>
