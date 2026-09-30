@@ -174,6 +174,45 @@ object MagnateIcons {
         }
     }
 
+    /**
+     * 卫星——卫星信号页的入口与空状态。
+     *
+     * 星体 + 两片太阳能板 + 天线：这是卫星最无歧义的轮廓。
+     * `material-icons-core` 里没有 GNSS/卫星图标（那在 extended 包里），
+     * 而 extended 禁用，所以自绘。
+     */
+    val Satellite: ImageVector = icon("MagnateSatellite") {
+        stroked {
+            // 星体
+            moveTo(10f, 9f)
+            lineTo(14f, 9f)
+            lineTo(14f, 15f)
+            lineTo(10f, 15f)
+            close()
+            // 左右太阳能板
+            moveTo(3f, 10f)
+            lineTo(7.2f, 10f)
+            lineTo(7.2f, 14f)
+            lineTo(3f, 14f)
+            close()
+            moveTo(16.8f, 10f)
+            lineTo(21f, 10f)
+            lineTo(21f, 14f)
+            lineTo(16.8f, 14f)
+            close()
+            // 连接杆。画到星体边缘就停，不要穿进去——穿过去会在描边交叠处
+            // 积出一块深色，看起来像个多余的结点
+            moveTo(7.2f, 12f)
+            lineTo(10f, 12f)
+            moveTo(14f, 12f)
+            lineTo(16.8f, 12f)
+            // 天线
+            moveTo(12f, 9f)
+            lineTo(12f, 5.6f)
+        }
+        filled { circle(12f, 4.2f, 1.3f) }
+    }
+
     /** 筛选 / 调节。三条滑轨，滑块错开。 */
     val Tune: ImageVector = icon("MagnateTune") {
         stroked {

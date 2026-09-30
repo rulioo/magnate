@@ -2,7 +2,6 @@ package com.magnate.compass.location
 
 import android.annotation.SuppressLint
 import android.content.Context
-import android.content.pm.PackageManager
 import android.location.Location
 import android.location.LocationListener
 import android.location.LocationManager
@@ -11,7 +10,8 @@ import android.os.Bundle
 import android.os.CancellationSignal
 import android.os.Looper
 import androidx.core.content.ContextCompat
-import androidx.core.location.LocationManagerCompat
+import com.magnate.compass.util.LocationPermissionLevel
+import com.magnate.compass.util.PermissionHelper
 import kotlinx.coroutines.channels.Channel
 import kotlinx.coroutines.coroutineScope
 import kotlinx.coroutines.flow.MutableStateFlow
@@ -54,14 +54,27 @@ class LocationProvider(private val context: Context) {
         override fun onProviderDisabled(provider: String) = Unit
     }
 
-    fun hasLocationPermission(): Boolean = LOCATION_PERMISSIONS.any {
-        ContextCompat.checkSelfPermission(context, it) == PackageManager.PERMISSION_GRANTED
-    }
+    /**
+     * 当前权限档位。
+     *
+     * 由 provider 代答而不是让 ViewModel 自己查：判定需要 `Context`，
+     * 而本项目的 ViewModel 一律不持有 Context——它们只拿 repository 与 provider。
+     *
+     * 逻辑本体只有 [PermissionHelper] 一份。此前这里有一份复制的
+     * `LOCATION_PERMISSIONS` 与 `hasLocationPermission()`，两处独立演化迟早会分叉。
+     */
+    fun permissionLevel(): LocationPermissionLevel = PermissionHelper.levelOf(context)
+
+    fun hasLocationPermission(): Boolean = PermissionHelper.hasLocationPermission(context)
 
     /** 定位服务总开关关闭时，直接跳过定位，不必等超时（design.md §10）。 */
     fun isAnyProviderEnabled(): Boolean {
         val m = manager ?: return false
-        return PROVIDER_PRIORITY.any { runCatching { m.isProviderEnabled(it) }.getOrDefault(false) }
+        return enabledProviders(m).isNotEmpty()
+    }
+
+    private fun enabledProviders(m: LocationManager): List<String> = PROVIDER_PRIORITY.filter {
+        runCatching { m.isProviderEnabled(it) }.getOrDefault(false)
     }
 
     /**
@@ -71,26 +84,38 @@ class LocationProvider(private val context: Context) {
     @SuppressLint("MissingPermission")
     fun startTracking() {
         val m = manager ?: return
-        if (tracking || !hasLocationPermission()) return
+        if (tracking || !PermissionHelper.hasLocationPermission(context)) return
 
-        val provider = PROVIDER_PRIORITY.firstOrNull {
-            runCatching { m.isProviderEnabled(it) }.getOrDefault(false)
-        } ?: return
+        val enabled = enabledProviders(m)
+        if (enabled.isEmpty()) return
 
         // 先用系统缓存里的最后位置垫一下，让主页立刻有坐标可显示。
-        runCatching { m.getLastKnownLocation(provider) }
-            .getOrNull()
-            ?.let { _lastKnown.value = it.toGeoPoint() }
+        // 看**全部**已启用的 provider，而不是只看优先级最高的那个：
+        // 只看 GPS 的话，「GPS 开着但还没定上位」时一个刚刷新的 NETWORK 缓存会被整个忽略，
+        // 而那恰是室内最需要垫底的场景。哪些缓存不可信由 selectBestLastKnown 负责筛。
+        val cached = enabled.mapNotNull { provider ->
+            runCatching { m.getLastKnownLocation(provider) }.getOrNull()?.toGeoPoint()
+        }
+        selectBestLastKnown(cached, System.currentTimeMillis())?.let { _lastKnown.value = it }
 
-        runCatching {
-            m.requestLocationUpdates(
-                provider,
-                TRACK_INTERVAL_MS,
-                TRACK_MIN_DISTANCE_M,
-                trackingListener,
-                Looper.getMainLooper(),
-            )
-        }.onSuccess { tracking = true }
+        // 同理，注册也覆盖全部已启用 provider。只注册 GPS 时，室内「已启用但定不上位」
+        // 的机器永远预热不出新坐标，而预热存在的全部意义就是这个场景。
+        // 代价是多一路 60s/50m 的注册，且只在主页可见期间存在——
+        // 这是对 design.md §9 的**有意修订**，不是疏漏。
+        val registered = enabled.map { provider ->
+            runCatching {
+                m.requestLocationUpdates(
+                    provider,
+                    TRACK_INTERVAL_MS,
+                    TRACK_MIN_DISTANCE_M,
+                    trackingListener,
+                    Looper.getMainLooper(),
+                )
+            }.isSuccess
+        }
+        // 注意不能写成 enabled.any { ... }：any 会在第一个成功后短路，
+        // 后面的 provider 就不会被注册了
+        tracking = registered.any { it }
     }
 
     /** `onPause` 立即注销传感器与定位，做到零后台耗电（design.md §9）。 */
@@ -102,21 +127,30 @@ class LocationProvider(private val context: Context) {
     }
 
     /**
-     * 保存时调用：缓存够新直接返回，否则主动定位，超时返回 null。
+     * 保存时调用：缓存够新直接返回，否则主动定位，超时返回原因。
      *
-     * 返回 null 是**正常路径**——保存不被定位阻塞（design.md §9 验收标准 8）。
+     * 失败是**正常路径**——保存不被定位阻塞（design.md §9 验收标准 8）。
+     * 但失败**必须带上原因**：返回值原先是个 `GeoPoint?`，把没权限、服务关闭、超时
+     * 三种情况压成同一个 `null`，于是界面只能一律写「请到窗边或室外再试」，
+     * 而当时绝大多数失败的真实原因是应用从未申请过权限——用户照做永远也不会好。
      */
     @SuppressLint("MissingPermission")
-    suspend fun acquire(timeoutMs: Long = DEFAULT_TIMEOUT_MS): GeoPoint? {
-        if (!hasLocationPermission()) return null
+    suspend fun acquire(timeoutMs: Long = DEFAULT_TIMEOUT_MS): LocationResult {
+        if (!PermissionHelper.hasLocationPermission(context)) return LocationResult.NoPermission
 
         _lastKnown.value
             ?.takeIf { System.currentTimeMillis() - it.locatedAt < CACHE_TTL_MS }
-            ?.let { return it }
+            ?.let { return LocationResult.Success(it) }
 
-        if (!isAnyProviderEnabled()) return null
+        if (!isAnyProviderEnabled()) return LocationResult.ServicesDisabled
 
         return withTimeoutOrNull(timeoutMs) { raceProviders() }
+            // 顺手记进缓存。这不只是省一次定位：主页那行「磁偏角需要坐标 · 去取坐标」
+            // 靠的就是 [lastKnown]，不写回去的话用户点完按钮屏幕上什么都不会变。
+            // 语义上也确实成立——一次成功的 acquire 就是最近一次定位。
+            ?.also { _lastKnown.value = it }
+            ?.let { LocationResult.Success(it) }
+            ?: LocationResult.Timeout
     }
 
     /**
@@ -203,12 +237,6 @@ class LocationProvider(private val context: Context) {
         }
 
     companion object {
-        /** Android 12+ 要求 COARSE 与 FINE 同时申请（design.md §7） */
-        val LOCATION_PERMISSIONS = arrayOf(
-            android.Manifest.permission.ACCESS_FINE_LOCATION,
-            android.Manifest.permission.ACCESS_COARSE_LOCATION,
-        )
-
         /** GPS 室外精度高，优先；NETWORK 室内可用但精度低，作兜底。 */
         private val PROVIDER_PRIORITY = listOf(
             LocationManager.GPS_PROVIDER,

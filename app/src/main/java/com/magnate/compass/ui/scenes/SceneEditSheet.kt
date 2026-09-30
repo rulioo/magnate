@@ -46,12 +46,18 @@ import com.magnate.compass.data.SceneWriteResult
 import com.magnate.compass.data.entity.CoordMode
 import com.magnate.compass.data.RecordWithRelations
 import com.magnate.compass.location.GeoPoint
+import com.magnate.compass.location.LocationResult
+import com.magnate.compass.ui.common.LocationAttemptFailure
+import com.magnate.compass.ui.common.LocalLocationPermissionGate
 import com.magnate.compass.ui.common.SectionDivider
 import com.magnate.compass.ui.common.SectionTitle
+import com.magnate.compass.ui.common.acquireLocationWithPermission
 import com.magnate.compass.ui.theme.BodyStyle
 import com.magnate.compass.ui.theme.LabelStyle
 import com.magnate.compass.util.GeoFormat
 import com.magnate.compass.util.TimeFormat
+import com.magnate.compass.util.locationFailureMessage
+import com.magnate.compass.util.offersSettings
 import kotlinx.coroutines.launch
 
 /**
@@ -75,13 +81,14 @@ fun SceneEditSheet(
     /** 新建场景时默认自动取一次坐标（§9.3）——用户多半就站在那个点上。 */
     autoAcquireOnOpen: Boolean,
     recentlyLocated: List<RecordWithRelations>,
-    onAcquire: suspend () -> GeoPoint?,
+    onAcquire: suspend () -> LocationResult,
     onOpenRecord: (Long) -> Unit,
     onSubmit: suspend (SceneDraft) -> SceneWriteResult,
     onDismiss: () -> Unit,
 ) {
     val sheetState = rememberModalBottomSheetState(skipPartiallyExpanded = true)
     val scope = rememberCoroutineScope()
+    val gate = LocalLocationPermissionGate.current
 
     var name by remember { mutableStateOf(initialName) }
     var note by remember { mutableStateOf(initialNote.orEmpty()) }
@@ -89,23 +96,44 @@ fun SceneEditSheet(
     var point by remember { mutableStateOf(initialPoint) }
 
     var acquiring by remember { mutableStateOf(false) }
-    var acquiringFailed by remember { mutableStateOf(false) }
+    var failure by remember { mutableStateOf<LocationAttemptFailure?>(null) }
     var manualEntry by remember { mutableStateOf(false) }
     var importing by remember { mutableStateOf(false) }
     var submitting by remember { mutableStateOf(false) }
 
-    fun acquire() {
+    /**
+     * @param userInitiated 是否是用户点出来的。
+     *
+     * 这个区分是必要的，不是礼貌问题：自动路径在面板打开的一瞬间触发，**没有用户手势**。
+     * 无手势就去弹系统权限框，在多数 ROM 上不可靠，而且用户此时还没表达任何想定位的意思。
+     * 所以自动路径失败时只记下原因，由内联的「开启」入口承担后续——那一下点击才是手势。
+     */
+    fun acquire(userInitiated: Boolean) {
         acquiring = true
-        acquiringFailed = false
-        scope.launch {
-            val result = onAcquire()
-            acquiring = false
-            if (result == null) acquiringFailed = true else point = result
+        failure = null
+
+        if (userInitiated) {
+            acquireLocationWithPermission(
+                scope = scope,
+                gate = gate,
+                acquire = onAcquire,
+                onSuccess = { acquiring = false; point = it },
+                onFailure = { acquiring = false; failure = it },
+            )
+        } else {
+            scope.launch {
+                val result = onAcquire()
+                acquiring = false
+                when (result) {
+                    is LocationResult.Success -> point = result.point
+                    else -> failure = LocationAttemptFailure(result, gate.state)
+                }
+            }
         }
     }
 
     LaunchedEffect(Unit) {
-        if (autoAcquireOnOpen && point == null) acquire()
+        if (autoAcquireOnOpen && point == null) acquire(userInitiated = false)
     }
 
     ModalBottomSheet(onDismissRequest = onDismiss, sheetState = sheetState) {
@@ -146,11 +174,16 @@ fun SceneEditSheet(
             CoordinatePreview(
                 point = point,
                 acquiring = acquiring,
-                acquiringFailed = acquiringFailed,
+                failure = failure,
+                onEnableLocation = { acquire(userInitiated = true) },
+                onOpenSettings = { gate.openAppSettings() },
             )
             Spacer(Modifier.height(8.dp))
             Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-                OutlinedButton(onClick = ::acquire, enabled = !acquiring) {
+                OutlinedButton(
+                    onClick = { acquire(userInitiated = true) },
+                    enabled = !acquiring,
+                ) {
                     Text("重新获取")
                 }
                 OutlinedButton(onClick = { manualEntry = true }) { Text("手动输入") }
@@ -226,7 +259,9 @@ fun SceneEditSheet(
             onConfirm = {
                 point = it
                 manualEntry = false
-                acquiringFailed = false
+                // 手动填了坐标，之前那条定位失败提示就没有意义了——留着它会让人以为
+                // 手里这份坐标没生效
+                failure = null
             },
             onDismiss = { manualEntry = false },
         )
@@ -245,7 +280,7 @@ fun SceneEditSheet(
                     locatedAt = it.record.locatedAt ?: it.record.timestamp,
                 )
                 importing = false
-                acquiringFailed = false
+                failure = null
             },
             onOpenRecord = onOpenRecord,
             onDismiss = { importing = false },
@@ -275,11 +310,21 @@ internal fun DuplicateNameDialog(onViewScene: () -> Unit, onDismiss: () -> Unit)
     )
 }
 
+/**
+ * 坐标预览。
+ *
+ * **失败行刻意放在 `when` 之外**，可以与前两行并存。原先它是 `when` 的一个分支，
+ * 且排在 `point != null` 之后，于是编辑一个已有坐标的场景时重新获取失败，
+ * 屏幕上是**一点反应都没有**——旧坐标还在，新失败被 `point != null` 吃掉。
+ * 保留下旧坐标本身是对的（重取失败不该把已有坐标抹掉），缺的只是那句失败说明。
+ */
 @Composable
 private fun CoordinatePreview(
     point: GeoPoint?,
     acquiring: Boolean,
-    acquiringFailed: Boolean,
+    failure: LocationAttemptFailure?,
+    onEnableLocation: () -> Unit,
+    onOpenSettings: () -> Unit,
 ) {
     Column(Modifier.fillMaxWidth()) {
         when {
@@ -309,18 +354,37 @@ private fun CoordinatePreview(
                 )
             }
 
-            acquiringFailed -> Text(
-                text = "定位失败。可以先创建场景，之后再补录坐标。",
-                style = BodyStyle,
-                color = MaterialTheme.colorScheme.error,
-            )
-
             else -> Text(
                 text = "尚未设置坐标。没有坐标的场景只是一个分组容器，" +
                     "场景内的记录不会继承到坐标。",
                 style = BodyStyle,
                 color = MaterialTheme.colorScheme.onSurfaceVariant,
             )
+        }
+
+        if (!acquiring && failure != null) {
+            locationFailureMessage(failure.result, failure.permissionState)?.let { message ->
+                Spacer(Modifier.height(6.dp))
+                Row(verticalAlignment = Alignment.CenterVertically) {
+                    Text(
+                        text = message,
+                        style = LabelStyle,
+                        color = MaterialTheme.colorScheme.error,
+                        modifier = Modifier.weight(1f, fill = false),
+                    )
+                    // 只有权限问题才给一个按钮。超时、定位总开关关闭这两类，
+                    // 点「开启」也不会好——那会变成一个按了没反应的按钮。
+                    if (failure.result == LocationResult.NoPermission) {
+                        val needsSettings =
+                            offersSettings(failure.result, failure.permissionState)
+                        TextButton(
+                            onClick = if (needsSettings) onOpenSettings else onEnableLocation,
+                        ) {
+                            Text(if (needsSettings) "去设置" else "开启")
+                        }
+                    }
+                }
+            }
         }
     }
 }

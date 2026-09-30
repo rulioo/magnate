@@ -9,6 +9,8 @@ import androidx.compose.material3.SnackbarHost
 import androidx.compose.material3.SnackbarHostState
 import androidx.compose.material3.SnackbarResult
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.CompositionLocalProvider
+import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.rememberCoroutineScope
 import androidx.compose.ui.Alignment
@@ -17,8 +19,12 @@ import androidx.compose.ui.unit.dp
 import androidx.navigation.compose.rememberNavController
 import com.magnate.compass.data.EffectiveLocation
 import com.magnate.compass.data.SaveOutcome
+import com.magnate.compass.ui.common.LocalLocationPermissionGate
+import com.magnate.compass.ui.common.LocationPermissionRationaleDialog
+import com.magnate.compass.ui.common.rememberLocationPermissionGate
 import com.magnate.compass.ui.nav.MagnateNavHost
 import com.magnate.compass.ui.nav.Routes
+import com.magnate.compass.util.LocationPermissionState
 import kotlinx.coroutines.launch
 
 /**
@@ -31,6 +37,10 @@ import kotlinx.coroutines.launch
  * 用 `Box` + 底部对齐而不是 `Scaffold`：每个二级页面自带 Scaffold 与 TopAppBar，
  * 再套一层 Scaffold 会让系统栏内边距被算两次，顶部凭空多出一截空白。
  * 根节点只需要一个浮在最上层的 Snackbar 位置。
+ *
+ * **定位权限的门也挂在这一层**，原因同样是「只有这里有某个东西」——
+ * `ActivityResultLauncher` 挂在面板里会随面板关闭而注销，导致系统权限框还开着时
+ * 划掉面板、授权成功后的重试永远不触发。详见 [rememberLocationPermissionGate]。
  */
 @Composable
 fun MagnateAppRoot() {
@@ -38,22 +48,44 @@ fun MagnateAppRoot() {
     val snackbarHostState = remember { SnackbarHostState() }
     val scope = rememberCoroutineScope()
 
-    Box(Modifier.fillMaxSize()) {
-        MagnateNavHost(
-            navController = navController,
-            onRecordSaved = { outcome ->
-                scope.launch { showSavedSnackbar(snackbarHostState, outcome, navController::navigate) }
-            },
-        )
+    // 定位权限的门挂在这一层，理由见 LocationPermissionGate 的类注释——
+    // 核心是面板里的 launcher 会随面板关闭而注销，导致授权后的重试永远不触发
+    val permissionGate = rememberLocationPermissionGate()
 
-        SnackbarHost(
-            hostState = snackbarHostState,
-            modifier = Modifier
-                .align(Alignment.BottomCenter)
-                .navigationBarsPadding()
-                .padding(16.dp),
-        )
+    LaunchedEffect(permissionGate) {
+        // 必须等 hasAsked 从偏好里读回来再判断。直接读会在它尚未加载时
+        // 拿到初始值 false，于是**每次启动**都会重新申请一遍
+        permissionGate.awaitLoaded()
+
+        if (!permissionGate.hasAsked && permissionGate.state != LocationPermissionState.GRANTED) {
+            // 启动时申请一次（design.md §7，本节已按用户决定修订）。
+            // 只问这一次：之后由主页常驻的「启用定位」条目承担后悔入口，
+            // 因为 Android 本身在两次拒绝后就不再弹框了，反复自动申请只会
+            // 让用户看到一个点了没反应的按钮，比不申请更糟
+            permissionGate.request(onGranted = {})
+        }
     }
+
+    CompositionLocalProvider(LocalLocationPermissionGate provides permissionGate) {
+        Box(Modifier.fillMaxSize()) {
+            MagnateNavHost(
+                navController = navController,
+                onRecordSaved = { outcome ->
+                    scope.launch { showSavedSnackbar(snackbarHostState, outcome, navController::navigate) }
+                },
+            )
+
+            SnackbarHost(
+                hostState = snackbarHostState,
+                modifier = Modifier
+                    .align(Alignment.BottomCenter)
+                    .navigationBarsPadding()
+                    .padding(16.dp),
+            )
+        }
+    }
+
+    LocationPermissionRationaleDialog(permissionGate)
 }
 
 /**

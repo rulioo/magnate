@@ -10,6 +10,7 @@ import com.magnate.compass.data.entity.CoordMode
 import com.magnate.compass.data.entity.SceneEntity
 import com.magnate.compass.location.GeoPoint
 import com.magnate.compass.location.LocationProvider
+import com.magnate.compass.location.LocationResult
 import kotlinx.coroutines.flow.SharingStarted
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.map
@@ -66,7 +67,8 @@ class SceneDetailViewModel(
     suspend fun rename(newName: String): SceneWriteResult =
         sceneRepository.renameScene(sceneId, newName)
 
-    suspend fun acquireLocation(): GeoPoint? =
+    /** 取一次坐标。失败原因一并返回，见 [LocationResult]。 */
+    suspend fun acquireLocation(): LocationResult =
         locationProvider.acquire(LocationProvider.DEFAULT_TIMEOUT_MS)
 
     /**

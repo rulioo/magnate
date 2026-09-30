@@ -63,15 +63,20 @@ import com.magnate.compass.data.SceneWriteResult
 import com.magnate.compass.data.entity.CoordMode
 import com.magnate.compass.data.entity.SceneEntity
 import com.magnate.compass.location.GeoPoint
+import com.magnate.compass.location.LocationResult
 import com.magnate.compass.ui.common.EmptyState
+import com.magnate.compass.ui.common.LocalLocationPermissionGate
 import com.magnate.compass.ui.common.SectionDivider
 import com.magnate.compass.ui.common.SectionTitle
+import com.magnate.compass.ui.common.acquireLocationWithPermission
 import com.magnate.compass.ui.common.openInMap
 import com.magnate.compass.ui.theme.BodyStyle
 import com.magnate.compass.ui.theme.LabelStyle
 import com.magnate.compass.ui.theme.LocalMagnateSemanticColors
 import com.magnate.compass.util.GeoFormat
 import com.magnate.compass.util.TimeFormat
+import com.magnate.compass.util.locationFailureMessage
+import com.magnate.compass.util.offersSettings
 import kotlinx.coroutines.launch
 
 /**
@@ -90,6 +95,7 @@ fun SceneDetailScreen(
     onOpenRecord: (Long) -> Unit,
     onOpenScene: (Long) -> Unit,
     onViewAllRecords: () -> Unit,
+    onOpenSatellite: () -> Unit,
 ) {
     val scene by viewModel.scene.collectAsStateWithLifecycle()
     val recordCount by viewModel.recordCount.collectAsStateWithLifecycle()
@@ -99,6 +105,7 @@ fun SceneDetailScreen(
     val context = LocalContext.current
     val scope = rememberCoroutineScope()
     val snackbarHostState = remember { SnackbarHostState() }
+    val gate = LocalLocationPermissionGate.current
 
     var showMenu by remember { mutableStateOf(false) }
     var showEditSheet by remember { mutableStateOf(false) }
@@ -283,18 +290,48 @@ fun SceneDetailScreen(
                 OutlinedButton(
                     onClick = {
                         acquiring = true
-                        scope.launch {
-                            val result = viewModel.acquireLocation()
-                            acquiring = false
-                            if (result == null) {
-                                snackbarHostState.showSnackbar("定位失败，请到窗边或室外再试")
-                            } else if (current.coordMode == CoordMode.FIXED && recordCount > 0) {
-                                // 影响面先算清楚，再让用户决定（§9.4）
-                                pendingPoint = result
-                            } else {
-                                applyLocation(result)
-                            }
-                        }
+                        acquireLocationWithPermission(
+                            scope = scope,
+                            gate = gate,
+                            acquire = viewModel::acquireLocation,
+                            onSuccess = { point ->
+                                acquiring = false
+                                if (current.coordMode == CoordMode.FIXED && recordCount > 0) {
+                                    // 影响面先算清楚，再让用户决定（§9.4）
+                                    pendingPoint = point
+                                } else {
+                                    applyLocation(point)
+                                }
+                            },
+                            onFailure = { failure ->
+                                acquiring = false
+                                val message = locationFailureMessage(
+                                    failure.result,
+                                    failure.permissionState,
+                                ) ?: return@acquireLocationWithPermission
+                                val settings = offersSettings(
+                                    failure.result,
+                                    failure.permissionState,
+                                )
+                                // 超时是唯一一句会劝用户「到窗边或室外」的文案，而那句话
+                                // 到底对不对，用户在这里就能自己验证——所以动作不是「去设置」，
+                                // 是「查看卫星」。把解释和证据放在一起，比让用户去猜强。
+                                val action = when {
+                                    settings -> "去设置"
+                                    failure.result == LocationResult.Timeout -> "查看卫星"
+                                    else -> null
+                                }
+                                scope.launch {
+                                    val outcome = snackbarHostState.showSnackbar(
+                                        message = message,
+                                        actionLabel = action,
+                                    )
+                                    if (outcome == SnackbarResult.ActionPerformed) {
+                                        if (settings) gate.openAppSettings() else onOpenSatellite()
+                                    }
+                                }
+                            },
+                        )
                     },
                     enabled = !acquiring,
                 ) {
@@ -318,6 +355,9 @@ fun SceneDetailScreen(
                         Text("在地图中打开")
                     }
                 }
+                // 定位失败和「为什么定位失败」应当只隔一次点击。从这一页点过去的人，
+                // 十有八九正是刚刚没取到坐标的那个
+                OutlinedButton(onClick = onOpenSatellite) { Text("卫星状态") }
             }
 
             Spacer(Modifier.height(16.dp))

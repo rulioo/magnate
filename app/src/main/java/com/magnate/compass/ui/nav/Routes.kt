@@ -12,6 +12,7 @@ object Routes {
     const val SEARCH = "search"
     const val SCENES = "scenes"
     const val TAGS = "tags"
+    const val SATELLITE = "satellite"
 
     const val RECORD_ID_ARG = "recordId"
     const val SCENE_ID_ARG = "sceneId"

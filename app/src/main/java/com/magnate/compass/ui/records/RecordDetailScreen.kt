@@ -70,8 +70,10 @@ import com.magnate.compass.ui.common.AccuracyBadge
 import com.magnate.compass.ui.common.AxisValuesRow
 import com.magnate.compass.ui.common.EmptyState
 import com.magnate.compass.ui.common.LevelBubble
+import com.magnate.compass.ui.common.LocalLocationPermissionGate
 import com.magnate.compass.ui.common.MagnateIcons
 import com.magnate.compass.ui.common.MagneticBar
+import com.magnate.compass.ui.common.acquireLocationWithPermission
 import com.magnate.compass.ui.common.openInMap
 import com.magnate.compass.ui.common.SectionDivider
 import com.magnate.compass.ui.common.SectionTitle
@@ -83,6 +85,8 @@ import com.magnate.compass.ui.theme.LocalMagnateSemanticColors
 import com.magnate.compass.ui.theme.MagnitudeDetailStyle
 import com.magnate.compass.util.GeoFormat
 import com.magnate.compass.util.TimeFormat
+import com.magnate.compass.util.locationFailureMessage
+import com.magnate.compass.util.offersSettings
 import kotlinx.coroutines.launch
 
 /**
@@ -105,6 +109,7 @@ fun RecordDetailScreen(
     val context = LocalContext.current
     val scope = rememberCoroutineScope()
     val snackbarHostState = remember { SnackbarHostState() }
+    val gate = LocalLocationPermissionGate.current
 
     var showMenu by remember { mutableStateOf(false) }
     var showMoveOutDialog by remember { mutableStateOf(false) }
@@ -195,14 +200,36 @@ fun RecordDetailScreen(
                     acquiring = acquiring,
                     onBackfill = {
                         acquiring = true
-                        viewModel.backfillLocation { ok ->
-                            acquiring = false
-                            scope.launch {
-                                snackbarHostState.showSnackbar(
-                                    if (ok) "已补录坐标" else "定位失败，可稍后到室外再试"
+                        acquireLocationWithPermission(
+                            scope = scope,
+                            gate = gate,
+                            acquire = viewModel::acquireLocation,
+                            onSuccess = { point ->
+                                acquiring = false
+                                viewModel.applyBackfilledLocation(point)
+                                scope.launch { snackbarHostState.showSnackbar("已补录坐标") }
+                            },
+                            onFailure = { failure ->
+                                acquiring = false
+                                val message = locationFailureMessage(
+                                    failure.result,
+                                    failure.permissionState,
+                                ) ?: return@acquireLocationWithPermission
+                                val settings = offersSettings(
+                                    failure.result,
+                                    failure.permissionState,
                                 )
-                            }
-                        }
+                                scope.launch {
+                                    val outcome = snackbarHostState.showSnackbar(
+                                        message = message,
+                                        actionLabel = if (settings) "去设置" else null,
+                                    )
+                                    if (outcome == SnackbarResult.ActionPerformed) {
+                                        gate.openAppSettings()
+                                    }
+                                }
+                            },
+                        )
                     },
                 )
 

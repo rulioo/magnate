@@ -8,7 +8,9 @@ import com.magnate.compass.data.RecordWithRelations
 import com.magnate.compass.data.SceneRepository
 import com.magnate.compass.data.TagRepository
 import com.magnate.compass.data.TagWithCount
+import com.magnate.compass.location.GeoPoint
 import com.magnate.compass.location.LocationProvider
+import com.magnate.compass.location.LocationResult
 import kotlinx.coroutines.flow.SharingStarted
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.first
@@ -72,21 +74,20 @@ class RecordDetailViewModel(
     }
 
     /**
-     * 补录坐标。
+     * 只取坐标、不落库。
      *
-     * 走与保存相同的缓存优先 + 超时降级路径。失败返回 false，UI 据此提示
-     * 「定位失败，可稍后再试」而不是静默什么都不做。
+     * **刻意与写入分开**：取坐标这一步可能要先弹权限说明框、再弹系统弹窗、授权后再重试，
+     * 整个过程由界面层的 `acquireLocationWithPermission` 驱动；把写入也塞进那个流程里，
+     * 就得让 ViewModel 去理解权限那套状态机。
+     *
+     * 走与保存相同的缓存优先 + 超时降级路径。
      */
-    fun backfillLocation(onResult: (Boolean) -> Unit) {
-        viewModelScope.launch {
-            val point = locationProvider.acquire(LocationProvider.DEFAULT_TIMEOUT_MS)
-            if (point == null) {
-                onResult(false)
-            } else {
-                recordRepository.updateLocation(recordId, point)
-                onResult(true)
-            }
-        }
+    suspend fun acquireLocation(): LocationResult =
+        locationProvider.acquire(LocationProvider.DEFAULT_TIMEOUT_MS)
+
+    /** 把补录到的坐标写进记录。 */
+    fun applyBackfilledLocation(point: GeoPoint) {
+        viewModelScope.launch { recordRepository.updateLocation(recordId, point) }
     }
 
     /** 删除。返回快照供 Snackbar 撤销。 */

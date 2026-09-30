@@ -461,12 +461,17 @@ class LocationProvider(private val context: Context) {
     @SuppressLint("MissingPermission")
     fun startTracking() { /* ... */ }
 
-    /** 保存时调用：缓存够新直接返回，否则主动定位，超时返回 null */
-    suspend fun acquire(timeoutMs: Long = 10_000): GeoPoint? {
+    /** 保存时调用：缓存够新直接返回，否则主动定位 */
+    suspend fun acquire(timeoutMs: Long = 10_000): LocationResult {
+        if (!PermissionHelper.hasLocationPermission(context)) return LocationResult.NoPermission
+        if (!manager.isProviderEnabled(GPS_PROVIDER)) return LocationResult.ServicesDisabled
         _lastKnown.value
             ?.takeIf { System.currentTimeMillis() - it.locatedAt < CACHE_TTL_MS }  // 120s
-            ?.let { return it }
-        return withTimeoutOrNull(timeoutMs) { requestCurrent() }
+            ?.let { return LocationResult.Success(it) }
+        return withTimeoutOrNull(timeoutMs) { raceProviders() }
+            ?.also { _lastKnown.value = it }   // 写回缓存，见下
+            ?.let { LocationResult.Success(it) }
+            ?: LocationResult.Timeout
     }
 
     /** API 30 前后两套路径 */
@@ -481,7 +486,15 @@ class LocationProvider(private val context: Context) {
 }
 ```
 
+**`acquire` 返回 `LocationResult` 而不是 `GeoPoint?`**：`null` 把"没权限""定位服务关着""超时"压成同一个值，于是四条调用路径只能共用一句失败文案，而这三者的处理方式完全不同——前两者点一下就能修好，超时才需要换位置。四个成员也保证每个 `when` 是穷尽的四分支。
+
+**刻意不放 `PermissionPermanentlyDenied`**：判断"能否再次申请"要 `shouldShowRequestPermissionRationale` 与打开系统设置页，两者都需要 `Activity`，而 provider 拿的是 application context。职责分离——provider 只报"发生了什么"，UI 层（有 Activity）用纯函数判定"为什么"。
+
+**取得的新坐标要写回 `_lastKnown`**：主页那行「磁偏角需要坐标 · 去取坐标」的判据就是 `lastKnown`。不写回的话，用户点完按钮、坐标明明取到了，屏幕上却什么都不会变。
+
 **Provider 选择顺序**：`GPS_PROVIDER`（室外精度高）→ `NETWORK_PROVIDER`（室内可用，精度低）。两者都尝试，取先返回且精度更好的一个。
+
+**缓存垫底要遍历全部已启用 provider**（`selectBestLastKnown`）：只看优先级最高的那一个，会在"GPS 已启用但还没定上位"时把一个 5 秒前刚更新的 NETWORK 缓存整个丢掉——而这恰恰是室内最需要垫底的场景。`locatedAt <= 0`（部分 ROM 的 `getLastKnownLocation` 返回 `time = 0`）与未来时间超容许偏差的候选一并丢弃，它们既过不了上面那道 TTL 检查，也会让"获取于"显示成 1970 年。
 
 **各场景下的超时预算**：
 
@@ -495,7 +508,7 @@ class LocationProvider(private val context: Context) {
 
 **补录坐标**：记录详情页与场景详情页均提供。用户在室外定位良好时打开旧记录/旧场景，触发一次定位并更新。这弥补了室内采样的固有短板。
 
-**功耗**：`startTracking` 仅在 `CompassScreen` 可见时运行，`onPause` 立即注销。60 秒间隔 + 50 米门槛的位置更新，功耗与一次普通消息推送相当。
+**功耗**：`startTracking` 仅在 `CompassScreen` 可见时运行，`onPause` 立即注销。60 秒间隔 + 50 米门槛的位置更新，功耗与一次普通消息推送相当。注册范围遍历全部已启用 provider 而非只注册 GPS，理由见 §9。
 
 ### 5.8 核心算法
 
@@ -854,13 +867,24 @@ suspend fun saveRecordWithTags(
 
 **存储权限不需要**：Room 数据库位于应用私有目录；未来导出走 MediaStore 或 SAF，同样无需 `WRITE_EXTERNAL_STORAGE`。
 
-**权限策略**：定位权限**不在启动时索取**。首次「获取场景坐标」「补录坐标」或「开启真北」时申请，并附说明理由的对话框。
+**权限策略：启动时申请一次，之后由常驻入口接管。**
+
+> 本节在 v1.3 被**有意改写**。原策略是"不在启动时索取，首次用到时才申请"，实践下来是错的：
+> 取坐标的四个入口里有两条是**打开面板即自动触发**的，那条路径没有用户手势，弹系统权限框在多数 ROM 上不可靠；
+> 而剩下两条要等用户点了「获取坐标」才问，用户看到的顺序就成了"先失败一次，再被问权限"。
+> 于是新装机上坐标功能看起来整个是坏的。改为启动时申请，让权限在用户第一次需要它之前就位。
+
+启动时的申请**只在从未申请过时自动弹一次**（由持久化的"问过了"标记把关），并且先弹一个说明理由的对话框。Android 在两次拒绝后系统本身就不再弹框，若无脑每次启动都申请，用户会看到一个点了没反应的按钮——比不申请更糟。
 
 拒绝后：
 - 测量与保存功能完全正常；
 - 场景可无坐标创建（只是失去坐标系能力，仍可作分组容器）；
 - 保留「启用定位」入口，供用户后悔时开启（用 `shouldShowRequestPermissionRationale` 判断可否再次申请，永久拒绝则引导到系统设置）；
 - 不重复弹窗骚扰。
+
+**权限档位必须区分 FINE 与 COARSE**：Android 12+ 下只有 COARSE 时拿到的是约 ±2km 的模糊坐标，会一路流进场景坐标里且没有任何解释。COARSE 仍是**合法降级**（不拒绝使用），但主页状态行要如实写成「粗略定位 · 磁偏角精度受限」并提供一键升级到精确。判定 `FINE 未授予而 COARSE 已授予` 为 `COARSE_ONLY` 是纯函数，见 §8 的 `PermissionHelper`。
+
+**卫星页需要 FINE**：API 29 起 `GnssStatus` 在只有 COARSE 时给出的是一个**空列表**，与"搜不到星"长得一模一样。卫星页对此显示权限横幅而不是一张空列表。
 
 **Manifest 要求**：Android 12+ 下 `ACCESS_COARSE_LOCATION` 与 `ACCESS_FINE_LOCATION` 必须**同时申请**，只申请 FINE 会被系统忽略。
 
@@ -973,13 +997,24 @@ LifecycleResumeEffect(Unit) {
 | 项 | 策略 |
 | --- | --- |
 | 采样率 | `SENSOR_DELAY_GAME`（约 50 Hz），UI 显示节流到 20 Hz |
-| 定位频率 | 60s 间隔 / 50m 位移门槛，**仅主页可见时**启用 |
+| 定位频率 | 60s 间隔 / 50m 位移门槛，**仅主页可见时**启用；注册**全部已启用 provider**，不只 GPS（见下） |
 | **FIXED 模式保存** | **完全不触发定位**，保存耗时 < 100ms |
 | 后台 | `onPause` 立即注销传感器与定位，**零后台耗电** |
+| **卫星页** | 只在页面可见时持有保活定位请求，**离开即注销**（见下） |
 | 重组优化 | 罗盘、磁场卡片、场景条各自订阅独立状态，避免全页重组 |
 | 列表性能 | `LazyColumn` + 稳定 `key = record.id`；数据类标 `@Immutable` |
 | 数据库 | 所有 DB 操作在 `Dispatchers.IO`；Room `Flow` 查询自动在后台线程 |
 | 搜索节流 | 搜索框 `debounce(300ms)` + `distinctUntilChanged()`，避免每键查库 |
+
+### 9.1 两处对"零后台耗电"的修订（v1.3）
+
+**主页预热改为遍历全部已启用 provider。** 原实现只注册 `GPS_PROVIDER`，于是室内"GPS 已启用但定不上位"的机器永远预热不出新坐标——而这个功能存在的意义恰恰是这个场景。代价是多一路 60s/50m 的注册，与原来同量级。`stopTracking()` 无需改动（`removeUpdates(listener)` 会移除该 listener 的全部请求），且只在主页 resume 期间发生。
+
+**卫星页自己持有一个保活定位请求。** 这不是选择而是平台事实：**注册 `GnssStatus.Callback` 不会启动 GNSS 引擎**，引擎只在存在活跃定位请求时运转，`onSatelliteStatusChanged` 也只在那时才回调。不持有请求的话，屏幕上永远是"尚未搜到卫星"——看起来和设备坏了没有任何区别。
+
+零后台耗电仍然成立，但保证方式变了：卫星流是**冷流**（`callbackFlow`），每个订阅者独立注册、取消订阅即注销，配合 `WhileSubscribed(0)` 使用。于是"可见才注册"是**结构性的**，不是一条需要记得遵守的纪律——离开页面保活请求就没了，不需要任何 `onPause` 钩子。订阅停止的延迟刻意取 0 而非项目惯用的 5000ms：那 5 秒宽限期是为"转屏、短暂遮挡"这类瞬断准备的，而这里任何延迟都会让 GPS 请求在页面已不可见之后继续存活。
+
+卫星页的请求**不复用 `startTracking()`**：那边的 `tracking` 是普通布尔量而不是引用计数（刻意的），两个拥有者共享一个布尔量时，后注销的那个会把另一个留在没注册的状态。同一应用对同一 provider 的两次 `requestLocationUpdates` 本来就是互相独立的注册，引擎按请求的并集运转，各管各的注销才是对的。两者实际上也不会重叠：导航会把 `CompassScreen` 移出组合，其 `LifecycleResumeEffect` 先触发 `stopTracking()`，唯一重叠是转场那一瞬，独立注册让它是无害的。
 
 ---
 
@@ -993,8 +1028,10 @@ LifecycleResumeEffect(Unit) {
 | 读数偏离 25–65 μT | 显示「检测到异常磁场」 |
 | 传感器精度 UNRELIABLE | 提示校准；**仍允许保存**，记录带精度徽标 |
 | 定位权限被拒 | 记录/场景不含坐标，标注「无坐标」，保留补录入口 |
-| 定位超时 | 按 §5.7 超时预算降级，**不阻塞保存** |
+| 定位超时 | 按 §5.7 超时预算降级，**不阻塞保存**；Snackbar 挂「查看卫星」让原因当场可查 |
 | 定位服务关闭 | `isProviderEnabled` 为 false 时直接跳过定位，不等超时 |
+| **卫星数据受阻** | 权限不足 / 定位服务关闭 / 设备无 GNSS，各给一句不同的横幅。**受阻时引擎状态栏显示「—」而非「引擎未启动」**——后者会把权限问题说成硬件问题，与横幅打架 |
+| 只有粗略定位权限 | 记录/场景仍可用（约 ±2km），但主页状态行明确标注「粗略定位 · 磁偏角精度受限」并提供升级入口；**卫星页直接显示权限横幅**，因为 API 29+ 下 COARSE 得到的是空列表，与"搜不到星"无法区分 |
 | **场景无坐标** | 记录解析为 `SceneWithoutCoordinate`，UI 提示「场景未设置坐标」+ 补录入口 |
 | **删除场景** | 记录 `sceneId` 置 null，**记录不删**；确认对话框明确告知 |
 | **删除激活中的场景** | 自动退出该场景（清除 DataStore 键），主页场景条回到「未选择场景」 |

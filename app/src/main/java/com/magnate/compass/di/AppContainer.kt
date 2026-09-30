@@ -7,6 +7,7 @@ import com.magnate.compass.data.SceneRepository
 import com.magnate.compass.data.SettingsStore
 import com.magnate.compass.data.TagRepository
 import com.magnate.compass.data.db.MagnateDatabase
+import com.magnate.compass.location.GnssProvider
 import com.magnate.compass.location.LocationProvider
 import com.magnate.compass.sensor.SensorRepository
 
@@ -25,6 +26,8 @@ class AppContainer(context: Context) {
     val sensorRepository: SensorRepository by lazy { SensorRepository(appContext) }
 
     val locationProvider: LocationProvider by lazy { LocationProvider(appContext) }
+
+    val gnssProvider: GnssProvider by lazy { GnssProvider(appContext) }
 
     val activeSceneStore: ActiveSceneStore by lazy { ActiveSceneStore(appContext) }
 

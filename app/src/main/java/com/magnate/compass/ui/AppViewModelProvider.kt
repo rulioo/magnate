@@ -10,6 +10,7 @@ import com.magnate.compass.ui.compass.CompassViewModel
 import com.magnate.compass.ui.nav.Routes
 import com.magnate.compass.ui.records.RecordDetailViewModel
 import com.magnate.compass.ui.records.RecordsViewModel
+import com.magnate.compass.ui.satellite.SatelliteViewModel
 import com.magnate.compass.ui.scenes.SceneDetailViewModel
 import com.magnate.compass.ui.scenes.SceneViewModel
 import com.magnate.compass.ui.search.SearchViewModel
@@ -90,6 +91,10 @@ object AppViewModelProvider {
 
         initializer {
             TagViewModel(tagRepository = container().tagRepository)
+        }
+
+        initializer {
+            SatelliteViewModel(gnssProvider = container().gnssProvider)
         }
     }
 

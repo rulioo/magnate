@@ -63,10 +63,14 @@ import com.magnate.compass.data.locationPolicyFor
 import com.magnate.compass.data.previewLocation
 import com.magnate.compass.location.GeoPoint
 import com.magnate.compass.location.LocationProvider
+import com.magnate.compass.location.LocationResult
 import com.magnate.compass.sensor.CompassMath
+import com.magnate.compass.ui.common.LocationAttemptFailure
 import com.magnate.compass.ui.common.LocationBadge
+import com.magnate.compass.ui.common.LocalLocationPermissionGate
 import com.magnate.compass.ui.common.SectionDivider
 import com.magnate.compass.ui.common.TagChip
+import com.magnate.compass.ui.common.acquireLocationWithPermission
 import com.magnate.compass.ui.scenes.ScenePickerSheet
 import com.magnate.compass.ui.theme.AxisValueStyle
 import com.magnate.compass.ui.theme.AzimuthDetailStyle
@@ -77,6 +81,8 @@ import com.magnate.compass.ui.theme.LocalMagnateSemanticColors
 import com.magnate.compass.ui.theme.MagnitudeDetailStyle
 import com.magnate.compass.util.GeoFormat
 import com.magnate.compass.util.TimeFormat
+import com.magnate.compass.util.locationFailureMessage
+import com.magnate.compass.util.offersSettings
 import kotlinx.coroutines.launch
 
 /**
@@ -98,7 +104,7 @@ fun SaveRecordSheet(
     scenes: List<SceneWithCount>,
     recentTags: List<TagWithCount>,
     lastKnownLocation: GeoPoint?,
-    acquireLocation: suspend (timeoutMs: Long) -> GeoPoint?,
+    acquireLocation: suspend (timeoutMs: Long) -> LocationResult,
     onCreateTag: suspend (String) -> TagWriteResult,
     onSave: suspend (SaveRecordRequest) -> SaveOutcome,
     onSaved: (SaveOutcome) -> Unit,
@@ -108,6 +114,7 @@ fun SaveRecordSheet(
     val sheetState = rememberModalBottomSheetState(skipPartiallyExpanded = true)
     val scope = rememberCoroutineScope()
     val semanticColors = LocalMagnateSemanticColors.current
+    val gate = LocalLocationPermissionGate.current
 
     // 归属场景在快照时刻确定，但允许用户在最后一刻改变——
     // 这避免了一个恼人的往返：「存错场景了 → 取消 → 切场景 → 重新测」（§5.3）
@@ -116,6 +123,7 @@ fun SaveRecordSheet(
     val selectedTags = remember { mutableStateListOf<String>() }
     var measured by remember { mutableStateOf(lastKnownLocation) }
     var acquiring by remember { mutableStateOf(false) }
+    var failure by remember { mutableStateOf<LocationAttemptFailure?>(null) }
     var saving by remember { mutableStateOf(false) }
     var showPicker by remember { mutableStateOf(false) }
     var showNewTag by remember { mutableStateOf(false) }
@@ -128,20 +136,66 @@ fun SaveRecordSheet(
         followSceneTimeoutMs = LocationProvider.FOLLOW_SCENE_TIMEOUT_MS,
     )
 
-    // 归属场景一变就重新定位。FIXED 场景直接跳过——它的坐标来自场景，本机定位毫无意义。
+    /**
+     * 归属场景一变就重新定位。FIXED 场景直接跳过——它的坐标来自场景，本机定位毫无意义。
+     *
+     * **这条路径不弹系统权限框**：它由面板打开触发，用户此刻并没有表达「我要定位」，
+     * 无手势的权限申请在多数 ROM 上也不可靠。失败原因记进 [failure]，
+     * 由场景卡片里那行「定位未开启 · 开启」承接——那一下点击才是手势。
+     *
+     * 归属场景切换时清掉上一次的失败：那是上一个场景的结论，留在这里会张冠李戴。
+     */
     LaunchedEffect(scene?.id, policy) {
         when (policy) {
             LocationPolicy.Skip -> {
                 acquiring = false
                 measured = null
+                failure = null
             }
 
             is LocationPolicy.Acquire -> {
                 acquiring = true
-                measured = acquireLocation(policy.timeoutMs)
+                failure = null
+                when (val result = acquireLocation(policy.timeoutMs)) {
+                    is LocationResult.Success -> measured = result.point
+                    else -> {
+                        // 置空，**不要退回 [lastKnownLocation]**：能走到超时，就说明那个缓存
+                        // 已经旧到被 acquire 的 TTL 拒了。把它显示成「这条记录将保存的坐标」
+                        // 是在编一个不会被写入的数。
+                        measured = null
+                        failure = LocationAttemptFailure(result, gate.state)
+                    }
+                }
                 acquiring = false
             }
         }
+    }
+
+    /**
+     * 用户点了那行「开启」。**这一下点击才是手势**，所以从这里才走权限门。
+     *
+     * 授权成功后门会替我们重试一次（见 `acquireLocationWithPermission`），
+     * 用的是与自动路径同一个超时预算，不再另外发明一套。
+     */
+    fun enableLocation() {
+        val timeoutMs = (policy as? LocationPolicy.Acquire)?.timeoutMs
+            ?: LocationProvider.DEFAULT_TIMEOUT_MS
+        acquiring = true
+        failure = null
+        acquireLocationWithPermission(
+            scope = scope,
+            gate = gate,
+            acquire = { acquireLocation(timeoutMs) },
+            onSuccess = {
+                acquiring = false
+                measured = it
+            },
+            onFailure = {
+                acquiring = false
+                measured = null
+                failure = it
+            },
+        )
     }
 
     // 焦点自动落在备注输入框（design-gui.md §15）
@@ -193,6 +247,35 @@ fun SaveRecordSheet(
                 location = previewLocation(scene, measured),
                 onClick = { showPicker = true },
             )
+
+            // 定位失败**不能只是不说话**：原来的实现里这条路径一点提示都没有，
+            // 用户只看到徽标变成「无坐标」，无从知道是权限没开、总开关没开，还是真没信号。
+            // 放在卡片**外面**：卡片整块可点（打开场景选择器），内嵌按钮会和那个手势打架。
+            failure?.let { attempt ->
+                locationFailureMessage(attempt.result, attempt.permissionState)?.let { message ->
+                    Spacer(Modifier.height(6.dp))
+                    Row(verticalAlignment = Alignment.CenterVertically) {
+                        Text(
+                            text = message,
+                            style = LabelStyle,
+                            color = MaterialTheme.colorScheme.error,
+                            modifier = Modifier.weight(1f, fill = false),
+                        )
+                        // 超时与服务关闭不给按钮——点了也不会好的按钮比没有按钮更糟
+                        if (attempt.result == LocationResult.NoPermission) {
+                            val needsSettings =
+                                offersSettings(attempt.result, attempt.permissionState)
+                            TextButton(
+                                onClick = {
+                                    if (needsSettings) gate.openAppSettings() else enableLocation()
+                                },
+                            ) {
+                                Text(if (needsSettings) "去设置" else "开启")
+                            }
+                        }
+                    }
+                }
+            }
 
             Spacer(Modifier.height(12.dp))
             SectionDivider()

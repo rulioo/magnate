@@ -26,6 +26,9 @@ import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.Button
 import androidx.compose.material3.Icon
 import androidx.compose.material3.MaterialTheme
+import androidx.compose.material3.SnackbarHost
+import androidx.compose.material3.SnackbarHostState
+import androidx.compose.material3.SnackbarResult
 import androidx.compose.material3.Switch
 import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
@@ -33,6 +36,7 @@ import androidx.compose.runtime.Composable
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
+import androidx.compose.runtime.rememberCoroutineScope
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
@@ -44,10 +48,13 @@ import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import com.magnate.compass.data.RecordDraft
 import com.magnate.compass.data.SaveOutcome
 import com.magnate.compass.data.entity.SceneEntity
+import com.magnate.compass.location.LocationProvider
 import com.magnate.compass.sensor.AccuracyLevel
 import com.magnate.compass.ui.common.AccuracyBadge
 import com.magnate.compass.ui.common.EmptyState
+import com.magnate.compass.ui.common.LocalLocationPermissionGate
 import com.magnate.compass.ui.common.MagnateIcons
+import com.magnate.compass.ui.common.acquireLocationWithPermission
 import com.magnate.compass.ui.scenes.ScenePickerSheet
 import com.magnate.compass.ui.theme.AzimuthReadoutStyle
 import com.magnate.compass.ui.theme.BodyStyle
@@ -55,6 +62,10 @@ import com.magnate.compass.ui.theme.ButtonSubtitleStyle
 import com.magnate.compass.ui.theme.LabelStyle
 import com.magnate.compass.ui.theme.LocalMagnateSemanticColors
 import com.magnate.compass.util.GeoFormat
+import com.magnate.compass.util.LocationPermissionLevel
+import com.magnate.compass.util.locationFailureMessage
+import com.magnate.compass.util.offersSettings
+import kotlinx.coroutines.launch
 
 /**
  * 主页（design-gui.md §3）。
@@ -67,6 +78,7 @@ fun CompassScreen(
     viewModel: CompassViewModel,
     onOpenRecords: () -> Unit,
     onOpenScenes: () -> Unit,
+    onOpenSatellite: () -> Unit,
     onRecordSaved: (SaveOutcome) -> Unit,
 ) {
     val state by viewModel.uiState.collectAsStateWithLifecycle()
@@ -74,6 +86,10 @@ fun CompassScreen(
     val recordCount by viewModel.recordCount.collectAsStateWithLifecycle()
     val recentTags by viewModel.observeRecentTags()
         .collectAsStateWithLifecycle(initialValue = emptyList())
+
+    val scope = rememberCoroutineScope()
+    val snackbarHostState = remember { SnackbarHostState() }
+    val gate = LocalLocationPermissionGate.current
 
     var showScenePicker by remember { mutableStateOf(false) }
     var showCalibration by remember { mutableStateOf(false) }
@@ -107,6 +123,55 @@ fun CompassScreen(
         pendingScene = state.activeScene
         pendingDraft = viewModel.freezeDraft()
         Unit
+    }
+
+    /**
+     * 「开启定位 / 去取坐标」。这两件事在实现上是同一件：先确保有权限，再拿一个坐标。
+     *
+     * **不必先 `gate.request` 再取坐标**——`acquireLocationWithPermission` 自己会处理权限，
+     * 没授权就先弹说明框、再弹系统框，授权后自动重试一次。手动分两步会连弹两次框。
+     *
+     * 成功时走 [CompassViewModel.onLocationPermissionGranted] 而不是只刷新状态：
+     * 授权之前 `startTracking()` 会在权限检查处提前返回且 `tracking` 保持 `false`，
+     * 主页的坐标预热根本没启动过，光刷新权限不会让它开始。
+     */
+    fun acquireFromHome() {
+        acquireLocationWithPermission(
+            scope = scope,
+            gate = gate,
+            acquire = { viewModel.acquireLocation(LocationProvider.DEFAULT_TIMEOUT_MS) },
+            onSuccess = { viewModel.onLocationPermissionGranted() },
+            onFailure = { failure ->
+                viewModel.refreshPermission()
+                val message = locationFailureMessage(failure.result, failure.permissionState)
+                    ?: return@acquireLocationWithPermission
+                val settings = offersSettings(failure.result, failure.permissionState)
+                scope.launch {
+                    val outcome = snackbarHostState.showSnackbar(
+                        message = message,
+                        actionLabel = if (settings) "去设置" else null,
+                    )
+                    if (outcome == SnackbarResult.ActionPerformed) gate.openAppSettings()
+                }
+            },
+        )
+    }
+
+    /**
+     * 「升级到精确」。
+     *
+     * 单独一个入口是必需的：Android 12+ 用户选了「大致位置」时，权限判定是**已授予**，
+     * 于是 `gate.request` 会同步回调 `onGranted` 而不弹任何窗——那会变成一个
+     * 按下去毫无反应的按钮。
+     */
+    fun upgradeToFine() {
+        gate.requestFineLocation(
+            onGranted = {
+                viewModel.onLocationPermissionGranted()
+                acquireFromHome()
+            },
+            onDenied = { viewModel.refreshPermission() },
+        )
     }
 
     // 边到边（enableEdgeToEdge）之下，其余六个页面都有 Scaffold 自动让开系统栏，
@@ -159,6 +224,9 @@ fun CompassScreen(
                         onSceneBarClick = { showScenePicker = true },
                         onCalibrate = { showCalibration = true },
                         onToggleTrueNorth = viewModel::setTrueNorth,
+                        onEnableLocation = ::acquireFromHome,
+                        onUpgradeToFine = ::upgradeToFine,
+                        onOpenSatellite = onOpenSatellite,
                         showDial = false,
                         onSave = onSaveClick,
                     )
@@ -172,6 +240,9 @@ fun CompassScreen(
                 onSceneBarClick = { showScenePicker = true },
                 onCalibrate = { showCalibration = true },
                 onToggleTrueNorth = viewModel::setTrueNorth,
+                onEnableLocation = ::acquireFromHome,
+                onUpgradeToFine = ::upgradeToFine,
+                onOpenSatellite = onOpenSatellite,
                 showDial = true,
                 dialSize = dialSize,
                 onSave = onSaveClick,
@@ -181,6 +252,13 @@ fun CompassScreen(
                     .padding(horizontal = 16.dp),
             )
         }
+
+        // 主页没有 Scaffold（它自带 windowInsetsPadding，见上面那段注释），
+        // 因此失败提示要自己挂一个宿主。悬浮在内容之上，不占布局。
+        SnackbarHost(
+            hostState = snackbarHostState,
+            modifier = Modifier.align(Alignment.BottomCenter),
+        )
     }
 
     // ————————————————————— 浮层 —————————————————————
@@ -249,6 +327,9 @@ private fun Dashboard(
     onSceneBarClick: () -> Unit,
     onCalibrate: () -> Unit,
     onToggleTrueNorth: (Boolean) -> Unit,
+    onEnableLocation: () -> Unit,
+    onUpgradeToFine: () -> Unit,
+    onOpenSatellite: () -> Unit,
     showDial: Boolean,
     onSave: () -> Unit,
     modifier: Modifier = Modifier,
@@ -304,7 +385,16 @@ private fun Dashboard(
 
         Spacer(Modifier.height(8.dp))
 
-        MetaRow(state = state, onToggleTrueNorth = onToggleTrueNorth)
+        MetaRow(
+            state = state,
+            onToggleTrueNorth = onToggleTrueNorth,
+            onEnableLocation = onEnableLocation,
+            onUpgradeToFine = onUpgradeToFine,
+        )
+
+        Spacer(Modifier.height(4.dp))
+
+        SatelliteEntry(onClick = onOpenSatellite)
 
         Spacer(Modifier.height(12.dp))
 
@@ -380,14 +470,92 @@ private fun AzimuthReadout(state: CompassUiState) {
     }
 }
 
-/** ⑥ 元信息行：磁偏角 + 真北开关。坐标状态已移入场景条（§3.2）。 */
+/**
+ * 卫星信号入口。
+ *
+ * **刻意不显示「可见 N 颗 / 已用 M 颗」。** 那需要主页常驻订阅 GNSS 流，
+ * 而订阅会带一个保活定位请求——GNSS 引擎一旦转起来就不便宜，主页却要一直开着。
+ * 主页现有的预热是 60s/50m 的低频注册，两者完全不是一个量级。
+ * 为一行随时可查的实时数字付这个电费不划算，而用户要它的时候，
+ * 点一下就有一个专门的页面把全部细节摆出来。
+ */
+@Composable
+private fun SatelliteEntry(onClick: () -> Unit) {
+    Row(
+        Modifier
+            .fillMaxWidth()
+            .heightIn(min = 36.dp)
+            .clickable(onClick = onClick),
+        verticalAlignment = Alignment.CenterVertically,
+    ) {
+        Icon(
+            imageVector = MagnateIcons.Satellite,
+            contentDescription = null,
+            tint = MaterialTheme.colorScheme.onSurfaceVariant,
+            modifier = Modifier.size(16.dp),
+        )
+        Spacer(Modifier.width(6.dp))
+        Text(
+            text = "查看卫星信号",
+            style = LabelStyle,
+            color = MaterialTheme.colorScheme.onSurfaceVariant,
+        )
+        Spacer(Modifier.width(2.dp))
+        Text(text = "›", style = LabelStyle, color = MaterialTheme.colorScheme.onSurfaceVariant)
+    }
+}
+
+/**
+ * 磁偏角状态行的四种形态（§3.2）。
+ *
+ * @param label 显示文字。
+ * @param actionable 是否可点。可点的那三种都是**用户点出来才有手势**的入口，
+ *   所以它们可以走到权限门那边去。
+ * @param warning 是否用警告色。只有「还差一步才能用」的三种是警告；
+ *   真北关掉只是没启用，不是问题。
+ */
+private class DeclinationStatus(
+    val label: String,
+    val actionable: Boolean,
+    val warning: Boolean,
+)
+
+/**
+ * ⑥ 元信息行：磁偏角状态 + 真北开关。坐标状态已移入场景条（§3.2）。
+ *
+ * **这一行原先只有两种形态**：有效值，或者一句「磁偏角需要坐标」。而后者把
+ * 「没权限」「只有粗略定位」「有权限但还没取到坐标」三件完全不同的事压成了一句，
+ * 用户看到它不知道该去做什么——尤其在没有权限时，旁边没有任何入口能让他补救。
+ */
 @Composable
 private fun MetaRow(
     state: CompassUiState,
     onToggleTrueNorth: (Boolean) -> Unit,
+    onEnableLocation: () -> Unit,
+    onUpgradeToFine: () -> Unit,
 ) {
     val semanticColors = LocalMagnateSemanticColors.current
-    val declinationMissing = state.trueNorth && state.declination == null
+
+    val status = when {
+        !state.trueNorth -> DeclinationStatus("磁偏角未启用", actionable = false, warning = false)
+
+        state.locationPermission == LocationPermissionLevel.NONE ->
+            DeclinationStatus("未开启定位 · 开启", actionable = true, warning = true)
+
+        // Android 12+ 选了「大致位置」时只给约 ±2km 的坐标。不说明白，
+        // 用户会以为磁偏角不准是应用算错了（§7）
+        state.locationPermission == LocationPermissionLevel.COARSE_ONLY ->
+            DeclinationStatus("粗略定位 · 磁偏角精度受限", actionable = true, warning = true)
+
+        state.declination == null ->
+            DeclinationStatus("磁偏角需要坐标 · 去取坐标", actionable = true, warning = true)
+
+        else -> DeclinationStatus(
+            label = "磁偏角 ${GeoFormat.formatSigned(state.declination!!)}°",
+            actionable = false,
+            warning = false,
+        )
+    }
 
     Row(
         Modifier
@@ -396,7 +564,17 @@ private fun MetaRow(
         verticalAlignment = Alignment.CenterVertically,
         horizontalArrangement = Arrangement.SpaceBetween,
     ) {
-        Row(verticalAlignment = Alignment.CenterVertically) {
+        Row(
+            modifier = Modifier.clickable(enabled = status.actionable) {
+                when {
+                    state.locationPermission == LocationPermissionLevel.COARSE_ONLY -> onUpgradeToFine()
+                    // 「未开启定位」与「需要坐标」在实现上是同一条路：
+                    // 先确保有权限，再拿一个坐标
+                    else -> onEnableLocation()
+                }
+            },
+            verticalAlignment = Alignment.CenterVertically,
+        ) {
             Icon(
                 imageVector = MagnateIcons.Explore,
                 contentDescription = null,
@@ -405,18 +583,24 @@ private fun MetaRow(
             )
             Spacer(Modifier.width(6.dp))
             Text(
-                text = when {
-                    !state.trueNorth -> "磁偏角未启用"
-                    declinationMissing -> "磁偏角需要坐标"
-                    else -> "磁偏角 ${GeoFormat.formatSigned(state.declination!!)}°"
-                },
+                text = status.label,
                 style = LabelStyle,
-                color = if (declinationMissing) {
+                color = if (status.warning) {
                     semanticColors.warning
                 } else {
                     MaterialTheme.colorScheme.onSurfaceVariant
                 },
             )
+            // 可点时补一个箭头。文案里的「开启 / 去取坐标」是动词，但没有视觉上的
+            // 可点击线索，用户不一定会去点它
+            if (status.actionable) {
+                Spacer(Modifier.width(2.dp))
+                Text(
+                    text = "›",
+                    style = LabelStyle,
+                    color = semanticColors.warning,
+                )
+            }
         }
 
         Row(verticalAlignment = Alignment.CenterVertically) {

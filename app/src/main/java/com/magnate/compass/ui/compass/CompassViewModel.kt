@@ -18,11 +18,13 @@ import com.magnate.compass.data.entity.SceneEntity
 import com.magnate.compass.data.previewLocation
 import com.magnate.compass.location.GeoPoint
 import com.magnate.compass.location.LocationProvider
+import com.magnate.compass.location.LocationResult
 import com.magnate.compass.sensor.AccuracyLevel
 import com.magnate.compass.sensor.CompassMath
 import com.magnate.compass.sensor.SensorRepository
 import com.magnate.compass.sensor.SensorSource
 import com.magnate.compass.sensor.accuracyLevelOf
+import com.magnate.compass.util.LocationPermissionLevel
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.SharingStarted
@@ -59,7 +61,15 @@ data class CompassUiState(
     val locationPreview: EffectiveLocation = EffectiveLocation.None,
     /** 最近一次定位点，供保存时的缓存复用 */
     val lastKnownLocation: GeoPoint? = null,
-    val hasLocationPermission: Boolean = false,
+
+    /**
+     * 定位权限档位。
+     *
+     * 曾经是一个 `Boolean hasLocationPermission`，写了六处、**读了零处**——死状态。
+     * 现在它有了唯一但真实的下游：`MetaRow` 据此区分「未开启定位」与「仅粗略定位」，
+     * 而后者在 Android 12+ 上只给约 ±2km 的坐标，不说明白用户会以为测的是一个点。
+     */
+    val locationPermission: LocationPermissionLevel = LocationPermissionLevel.NONE,
     val sensorAvailable: Boolean = true,
 ) {
     /** 界面上该显示的方位角：真北模式下把磁偏角算进去。 */
@@ -119,7 +129,7 @@ class CompassViewModel(
 ) : ViewModel() {
 
     private val _sensor = MutableStateFlow(SensorSnapshot())
-    private val _hasPermission = MutableStateFlow(false)
+    private val _hasPermission = MutableStateFlow(LocationPermissionLevel.NONE)
     private val _sensorAvailable = MutableStateFlow(true)
 
     private var sensorJob: Job? = null
@@ -171,7 +181,7 @@ class CompassViewModel(
                 activeScene = scene,
                 locationPreview = previewLocation(scene, lastKnown),
                 lastKnownLocation = lastKnown,
-                hasLocationPermission = permission,
+                locationPermission = permission,
                 sensorAvailable = available,
             )
         }.stateIn(
@@ -179,13 +189,13 @@ class CompassViewModel(
             started = SharingStarted.WhileSubscribed(5_000),
             initialValue = CompassUiState(
                 sensorAvailable = sensorRepository.hasMagnetometer(),
-                hasLocationPermission = locationProvider.hasLocationPermission(),
+                locationPermission = locationProvider.permissionLevel(),
             ),
         )
 
     init {
         _sensorAvailable.value = sensorRepository.hasMagnetometer()
-        _hasPermission.value = locationProvider.hasLocationPermission()
+        _hasPermission.value = locationProvider.permissionLevel()
     }
 
     /** 场景选择器的数据源。按 `updatedAt` 降序，最近使用的在最上。 */
@@ -210,7 +220,7 @@ class CompassViewModel(
     fun startListening() {
         if (sensorJob != null) return
 
-        _hasPermission.value = locationProvider.hasLocationPermission()
+        _hasPermission.value = locationProvider.permissionLevel()
         locationProvider.startTracking()
 
         sensorJob = viewModelScope.launch {
@@ -325,16 +335,35 @@ class CompassViewModel(
     }
 
     fun refreshPermission() {
-        _hasPermission.value = locationProvider.hasLocationPermission()
+        _hasPermission.value = locationProvider.permissionLevel()
+    }
+
+    /**
+     * 授权成功后调用。
+     *
+     * 除了刷新状态，**还必须补一次 [LocationProvider.startTracking]**：
+     * 授权之前它会在 `!hasLocationPermission()` 处提前返回，且 `tracking` 保持 `false`，
+     * 于是主页的坐标预热从来没有真正启动过——用户在主页上永远等不到 `lastKnown` 出现。
+     *
+     * 不能改用 [startListening] 代替：它在 `sensorJob != null` 时提前返回，
+     * 而走到这里时传感器早就开着，等于什么都没做。
+     */
+    fun onLocationPermissionGranted() {
+        refreshPermission()
+        locationProvider.startTracking()
     }
 
     // ————————————————————— 保存面板的数据 —————————————————————
 
     /**
-     * 按预算主动定位。返回 null 是**正常路径**——缓存够新就直接返回缓存，
-     * 超时、无权限、定位服务关闭都返回 null，保存照常进行（design.md §5.7）。
+     * 按预算主动定位。失败是**正常路径**——缓存够新就直接返回缓存，
+     * 超时、无权限、定位服务关闭都不阻塞保存（design.md §5.7）。
+     *
+     * 但失败**带原因**返回，界面才能把话说到点子上：
+     * 没权限就说没权限，而不是一律让用户去室外站着。
      */
-    suspend fun acquireLocation(timeoutMs: Long): GeoPoint? = locationProvider.acquire(timeoutMs)
+    suspend fun acquireLocation(timeoutMs: Long): LocationResult =
+        locationProvider.acquire(timeoutMs)
 
     /** 保存面板的 chip 流：最近使用的 8 个标签（design-gui.md §5.6）。 */
     fun observeRecentTags(): Flow<List<TagWithCount>> = tagRepository.observeRecentlyUsed()

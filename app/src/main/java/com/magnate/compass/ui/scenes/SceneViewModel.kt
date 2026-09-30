@@ -9,8 +9,8 @@ import com.magnate.compass.data.SceneRepository
 import com.magnate.compass.data.SceneWithCount
 import com.magnate.compass.data.SceneWriteResult
 import com.magnate.compass.data.entity.CoordMode
-import com.magnate.compass.location.GeoPoint
 import com.magnate.compass.location.LocationProvider
+import com.magnate.compass.location.LocationResult
 import kotlinx.coroutines.flow.SharingStarted
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.map
@@ -64,8 +64,12 @@ class SceneViewModel(
      *
      * 用完整超时预算而非场景保存时的 3s：建场景时人多半就站在那个点上等结果，
      * 拿到一个精确坐标比快 7 秒重要得多。
+     *
+     * 返回 [LocationResult] 而非可空的 `GeoPoint`：失败原因要一路传到界面上，
+     * 否则「没权限」会被写成「请到窗边或室外再试」，用户照做永远也不会好。
+     * 权限申请与自动重试由界面层的 `acquireLocationWithPermission` 包在外面。
      */
-    suspend fun acquireLocation(): GeoPoint? =
+    suspend fun acquireLocation(): LocationResult =
         locationProvider.acquire(LocationProvider.DEFAULT_TIMEOUT_MS)
 
     fun setCoordMode(id: Long, mode: CoordMode) {

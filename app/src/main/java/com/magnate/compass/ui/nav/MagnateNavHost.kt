@@ -16,6 +16,8 @@ import com.magnate.compass.ui.records.RecordDetailScreen
 import com.magnate.compass.ui.records.RecordDetailViewModel
 import com.magnate.compass.ui.records.RecordListScreen
 import com.magnate.compass.ui.records.RecordsViewModel
+import com.magnate.compass.ui.satellite.SatelliteScreen
+import com.magnate.compass.ui.satellite.SatelliteViewModel
 import com.magnate.compass.ui.scenes.SceneDetailScreen
 import com.magnate.compass.ui.scenes.SceneDetailViewModel
 import com.magnate.compass.ui.scenes.SceneListScreen
@@ -51,8 +53,14 @@ fun MagnateNavHost(
                 viewModel = viewModel,
                 onOpenRecords = { navController.navigate(Routes.RECORDS) },
                 onOpenScenes = { navController.navigate(Routes.SCENES) },
+                onOpenSatellite = { navController.navigate(Routes.SATELLITE) },
                 onRecordSaved = onRecordSaved,
             )
+        }
+
+        composable(Routes.SATELLITE) {
+            val viewModel: SatelliteViewModel = viewModel(factory = AppViewModelProvider.Factory)
+            SatelliteScreen(viewModel = viewModel, onBack = { navController.popBackStack() })
         }
 
         composable(Routes.RECORDS) {
@@ -126,6 +134,7 @@ fun MagnateNavHost(
                     }
                 },
                 onViewAllRecords = { navController.navigate(Routes.RECORDS) },
+                onOpenSatellite = { navController.navigate(Routes.SATELLITE) },
             )
         }
     }
