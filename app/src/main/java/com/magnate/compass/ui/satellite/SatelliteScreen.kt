@@ -19,7 +19,6 @@ import androidx.compose.foundation.lazy.items
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.automirrored.outlined.ArrowBack
-import androidx.compose.material3.Button
 import androidx.compose.material3.ExperimentalMaterial3Api
 import androidx.compose.material3.Icon
 import androidx.compose.material3.IconButton
@@ -46,6 +45,7 @@ import com.magnate.compass.location.GnssFormat
 import com.magnate.compass.location.GnssSnapshot
 import com.magnate.compass.location.SatelliteInfo
 import com.magnate.compass.location.SignalTier
+import com.magnate.compass.ui.common.Banner
 import com.magnate.compass.ui.common.LocalLocationPermissionGate
 import com.magnate.compass.ui.common.SectionDivider
 import com.magnate.compass.ui.common.SectionTitle
@@ -115,7 +115,7 @@ fun SatelliteScreen(
                     message = banner,
                     // 权限不足时才给按钮。服务关闭与硬件不可用都得去系统设置或换设备，
                     // 在这个页面上放一个按了没反应的按钮比不放更糟
-                    onFix = if (snapshot.blocked == GnssBlock.PERMISSION) {
+                    onAction = if (snapshot.blocked == GnssBlock.PERMISSION) {
                         {
                             // 用 requestFineLocation 而不是 request：能走到这个横幅，
                             // 说明权限判定是「已授予」（只有粗略），request 会同步回调
@@ -175,31 +175,6 @@ fun SatelliteScreen(
                     item { FooterNote() }
                 }
             }
-        }
-    }
-}
-
-/**
- * 顶部横幅。三种 [GnssBlock] 各自一句话。
- *
- * 用警告色而不是错误色：它们都是**可修复的配置问题**，不是故障。
- * 把它们画成红色会让用户以为设备坏了。
- */
-@Composable
-private fun Banner(message: String, onFix: (() -> Unit)?) {
-    val warning = LocalMagnateSemanticColors.current.warning
-
-    Column(
-        Modifier
-            .fillMaxWidth()
-            .padding(horizontal = 16.dp, vertical = 8.dp)
-            .background(warning.copy(alpha = 0.12f), RoundedCornerShape(12.dp))
-            .padding(12.dp),
-    ) {
-        Text(text = message, style = BodyStyle, color = MaterialTheme.colorScheme.onSurface)
-        if (onFix != null) {
-            Spacer(Modifier.height(8.dp))
-            Button(onClick = onFix) { Text("开启精确定位") }
         }
     }
 }

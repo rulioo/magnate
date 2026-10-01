@@ -22,7 +22,6 @@ import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.automirrored.outlined.List
-import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.Button
 import androidx.compose.material3.Icon
 import androidx.compose.material3.MaterialTheme
@@ -31,7 +30,6 @@ import androidx.compose.material3.SnackbarHostState
 import androidx.compose.material3.SnackbarResult
 import androidx.compose.material3.Switch
 import androidx.compose.material3.Text
-import androidx.compose.material3.TextButton
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
@@ -40,6 +38,7 @@ import androidx.compose.runtime.rememberCoroutineScope
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.draw.alpha
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.Dp
 import androidx.compose.ui.unit.dp
@@ -49,8 +48,8 @@ import com.magnate.compass.data.RecordDraft
 import com.magnate.compass.data.SaveOutcome
 import com.magnate.compass.data.entity.SceneEntity
 import com.magnate.compass.location.LocationProvider
-import com.magnate.compass.sensor.AccuracyLevel
 import com.magnate.compass.ui.common.AccuracyBadge
+import com.magnate.compass.ui.common.Banner
 import com.magnate.compass.ui.common.EmptyState
 import com.magnate.compass.ui.common.LocalLocationPermissionGate
 import com.magnate.compass.ui.common.MagnateIcons
@@ -92,7 +91,10 @@ fun CompassScreen(
     val gate = LocalLocationPermissionGate.current
 
     var showScenePicker by remember { mutableStateOf(false) }
-    var showCalibration by remember { mutableStateOf(false) }
+
+    // 校准是**主页上的一种模式**，不是一条可以离开的路线——用户要一边画 8 字
+    // 一边看着读数回升，那两件事必须同屏（design-gui.md §11「校准中」）
+    val calibrationMode by viewModel.calibrationMode.collectAsStateWithLifecycle()
 
     // 保存面板的输入：**点击瞬间冻结**。之后传感器继续刷新，面板里的数字纹丝不动（§5.5）。
     var pendingDraft by remember { mutableStateOf<RecordDraft?>(null) }
@@ -185,6 +187,24 @@ fun CompassScreen(
         // 因此在这里先取出来（design-gui.md §14 横屏左右分栏：左罗盘，右信息与操作）
         val landscape = maxWidth > maxHeight
 
+        val bannerMessage = state.calibrationBanner
+
+        // 校准面板的高度上限。**表盘在校准期间必须仍然可见**——
+        // design-gui.md §11 写的就是「顶部提示条 + 表盘降为 50% 透明度」，
+        // 让面板吃掉整屏等于把校准偷偷做成了一条独立路由，违背那条承诺。
+        val panelMaxHeight = minOf(
+            maxHeight * CALIBRATION_PANEL_MAX_FRACTION,
+            CALIBRATION_PANEL_ABS_MAX,
+        )
+
+        // 顶部让出的高度。表盘尺寸必须把它扣掉：提示条是**常驻**的，
+        // 不扣的话它会把读数挤出可视区，而 design-gui.md §3 明确反对挤压罗盘空间。
+        val topReserve = when {
+            calibrationMode -> panelMaxHeight + 16.dp
+            bannerMessage != null -> BANNER_ALLOWANCE
+            else -> 0.dp
+        }
+
         // 表盘尺寸取「宽度允许」「高度允许」「绝对上限」三者中的最小值，再抬到下限。
         //
         // 高度这一项是必需的：只看宽度的话，竖屏窄机上能算出 320dp，
@@ -192,73 +212,95 @@ fun CompassScreen(
         // 会把读数挤出可视区——表盘越大反而越难用。
         // 下限则保证任何情况下表盘都不会缩到让方位字母挤成一团（design-gui.md §13）。
         val dialFits = if (landscape) {
-            minOf(maxWidth / 2 - 40.dp, maxHeight - 16.dp, MAX_DIAL)
+            minOf(maxWidth / 2 - 40.dp, maxHeight - topReserve - 16.dp, MAX_DIAL)
         } else {
-            minOf(maxWidth - 32.dp, maxHeight * 0.45f, MAX_DIAL)
+            minOf(maxWidth - 32.dp, (maxHeight - topReserve) * 0.45f, MAX_DIAL)
         }
         val dialSize = dialFits.coerceAtLeast(MIN_DIAL)
 
-        if (landscape) {
-            Row(
-                Modifier
-                    .fillMaxSize()
-                    .padding(horizontal = 16.dp, vertical = 8.dp),
-                verticalAlignment = Alignment.CenterVertically,
-            ) {
-                Box(Modifier.weight(1f), contentAlignment = Alignment.Center) {
-                    CompassDial(
-                        azimuthDeg = state.displayAzimuthDeg,
-                        headingName = state.displayHeadingName,
-                        modifier = Modifier.size(dialSize),
-                    )
-                }
-                Column(
-                    Modifier
-                        .weight(1f)
-                        .verticalScroll(rememberScrollState()),
-                ) {
+        // 表盘统一降到 50% 透明度，横竖屏两条分支一致（design-gui.md §11）
+        val dialAlpha = if (calibrationMode) CALIBRATION_DIAL_ALPHA else 1f
+
+        Column(Modifier.fillMaxSize()) {
+            if (calibrationMode) {
+                CalibrationPanel(
+                    state = state,
+                    onFinish = viewModel::finishCalibration,
+                    modifier = Modifier.heightIn(max = panelMaxHeight),
+                )
+            } else if (bannerMessage != null) {
+                // 整条可点。文案里自带动词（「· 点此校准」「· 查看」），
+                // 因为一个没有任何可点击线索的矩形，用户不会去点它
+                Banner(message = bannerMessage, onClick = viewModel::startCalibration)
+            }
+
+            Box(Modifier.weight(1f)) {
+                if (landscape) {
+                    Row(
+                        Modifier
+                            .fillMaxSize()
+                            .padding(horizontal = 16.dp, vertical = 8.dp),
+                        verticalAlignment = Alignment.CenterVertically,
+                    ) {
+                        Box(Modifier.weight(1f), contentAlignment = Alignment.Center) {
+                            CompassDial(
+                                azimuthDeg = state.displayAzimuthDeg,
+                                headingName = state.displayHeadingName,
+                                modifier = Modifier
+                                    .size(dialSize)
+                                    .alpha(dialAlpha),
+                            )
+                        }
+                        Column(
+                            Modifier
+                                .weight(1f)
+                                .verticalScroll(rememberScrollState()),
+                        ) {
+                            Dashboard(
+                                state = state,
+                                recordCount = recordCount,
+                                onOpenRecords = onOpenRecords,
+                                onSceneBarClick = { showScenePicker = true },
+                                onCalibrate = viewModel::startCalibration,
+                                onToggleTrueNorth = viewModel::setTrueNorth,
+                                onEnableLocation = ::acquireFromHome,
+                                onUpgradeToFine = ::upgradeToFine,
+                                onOpenSatellite = onOpenSatellite,
+                                showDial = false,
+                                onSave = onSaveClick,
+                            )
+                        }
+                    }
+                } else {
                     Dashboard(
                         state = state,
                         recordCount = recordCount,
                         onOpenRecords = onOpenRecords,
                         onSceneBarClick = { showScenePicker = true },
-                        onCalibrate = { showCalibration = true },
+                        onCalibrate = viewModel::startCalibration,
                         onToggleTrueNorth = viewModel::setTrueNorth,
                         onEnableLocation = ::acquireFromHome,
                         onUpgradeToFine = ::upgradeToFine,
                         onOpenSatellite = onOpenSatellite,
-                        showDial = false,
+                        showDial = true,
+                        dialSize = dialSize,
+                        dialAlpha = dialAlpha,
                         onSave = onSaveClick,
+                        modifier = Modifier
+                            .fillMaxSize()
+                            .verticalScroll(rememberScrollState())
+                            .padding(horizontal = 16.dp),
                     )
                 }
-            }
-        } else {
-            Dashboard(
-                state = state,
-                recordCount = recordCount,
-                onOpenRecords = onOpenRecords,
-                onSceneBarClick = { showScenePicker = true },
-                onCalibrate = { showCalibration = true },
-                onToggleTrueNorth = viewModel::setTrueNorth,
-                onEnableLocation = ::acquireFromHome,
-                onUpgradeToFine = ::upgradeToFine,
-                onOpenSatellite = onOpenSatellite,
-                showDial = true,
-                dialSize = dialSize,
-                onSave = onSaveClick,
-                modifier = Modifier
-                    .fillMaxSize()
-                    .verticalScroll(rememberScrollState())
-                    .padding(horizontal = 16.dp),
-            )
-        }
 
-        // 主页没有 Scaffold（它自带 windowInsetsPadding，见上面那段注释），
-        // 因此失败提示要自己挂一个宿主。悬浮在内容之上，不占布局。
-        SnackbarHost(
-            hostState = snackbarHostState,
-            modifier = Modifier.align(Alignment.BottomCenter),
-        )
+                // 主页没有 Scaffold（它自带 windowInsetsPadding，见上面那段注释），
+                // 因此失败提示要自己挂一个宿主。悬浮在内容之上，不占布局。
+                SnackbarHost(
+                    hostState = snackbarHostState,
+                    modifier = Modifier.align(Alignment.BottomCenter),
+                )
+            }
+        }
     }
 
     // ————————————————————— 浮层 —————————————————————
@@ -277,13 +319,6 @@ fun CompassScreen(
                 onOpenScenes()
             },
             onDismiss = { showScenePicker = false },
-        )
-    }
-
-    if (showCalibration) {
-        CalibrationDialog(
-            accuracy = state.accuracy,
-            onDismiss = { showCalibration = false },
         )
     }
 
@@ -334,6 +369,8 @@ private fun Dashboard(
     onSave: () -> Unit,
     modifier: Modifier = Modifier,
     dialSize: Dp = 320.dp,
+    /** 校准模式下表盘降到 50% 透明度，让视线落在顶部的校准面板上（design-gui.md §11）。 */
+    dialAlpha: Float = 1f,
 ) {
     Column(modifier) {
         StatusBar(
@@ -353,7 +390,9 @@ private fun Dashboard(
                 CompassDial(
                     azimuthDeg = state.displayAzimuthDeg,
                     headingName = state.displayHeadingName,
-                    modifier = Modifier.size(dialSize),
+                    modifier = Modifier
+                        .size(dialSize)
+                        .alpha(dialAlpha),
                 )
             }
         }
@@ -646,37 +685,6 @@ private fun SaveButton(scene: SceneEntity?, onClick: () -> Unit) {
     }
 }
 
-/** 校准引导。低精度与不可信都会走到这里（design.md §5.9）。 */
-@Composable
-private fun CalibrationDialog(
-    accuracy: AccuracyLevel,
-    onDismiss: () -> Unit,
-) {
-    AlertDialog(
-        onDismissRequest = onDismiss,
-        title = { Text("磁力计需要校准", style = BodyStyle) },
-        text = {
-            Text(
-                text = "手持手机在空中画几个「8」字，重复 5–10 次。\n\n" +
-                    "当前精度：${accuracy.label()}。附近有铁磁物体或强电流时读数也会偏差，" +
-                    "可以换个位置再测。",
-                style = BodyStyle,
-            )
-        },
-        confirmButton = {
-            TextButton(onClick = onDismiss) { Text("知道了") }
-        },
-    )
-}
-
-private fun AccuracyLevel.label(): String = when (this) {
-    AccuracyLevel.HIGH -> "高"
-    AccuracyLevel.MEDIUM -> "中"
-    AccuracyLevel.LOW -> "低"
-    AccuracyLevel.UNRELIABLE -> "不可信"
-    AccuracyLevel.UNKNOWN -> "未知"
-}
-
 /** 表盘边长上限：再大也不会更容易读，只会把下面的读数挤出屏幕。 */
 private val MAX_DIAL = 320.dp
 
@@ -688,3 +696,25 @@ private val MAX_DIAL = 320.dp
  * 再小 `CompassDial` 会主动降级成只画 N/E/S/W（见其三级降级注释）。
  */
 private val MIN_DIAL = 180.dp
+
+/**
+ * 校准面板最多占屏高的比例。
+ *
+ * 上限来自 design-gui.md §11——校准期间**表盘必须仍然可见**，
+ * 面板吃掉整屏就等于把校准做成了独立路由，而用户需要一边画 8 字一边看读数。
+ */
+private const val CALIBRATION_PANEL_MAX_FRACTION = 0.55f
+
+/** 大屏上的绝对上限：再高也不会更好读，只会让视线离开表盘更远。 */
+private val CALIBRATION_PANEL_ABS_MAX = 380.dp
+
+/** 校准模式下表盘的透明度（design-gui.md §11）。 */
+private const val CALIBRATION_DIAL_ALPHA = 0.5f
+
+/**
+ * 常驻提示条给表盘让出的高度。
+ *
+ * 提示条是**常驻**的，不预留的话它会把下方内容整体下推，
+ * 而 design-gui.md §3 明确反对挤压罗盘空间。宁可让表盘小一点。
+ */
+private val BANNER_ALLOWANCE = 64.dp

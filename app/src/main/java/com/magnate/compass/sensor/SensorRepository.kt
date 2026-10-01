@@ -18,6 +18,10 @@ import kotlinx.coroutines.flow.callbackFlow
  *
  * 磁场**始终**直接读 `TYPE_MAGNETIC_FIELD` 原始值——旋转矢量经过融合与归一化，
  * 丢失了真实场强量级，不能用于强度测量（design.md §2.2）。
+ *
+ * 另外**尽力**注册 `TYPE_MAGNETIC_FIELD_UNCALIBRATED`（API 18，minSdk 24 起恒可用）：
+ * 它的 `values[3..5]` 是系统估计的硬磁偏置，是「校准够不够」唯一的判据来源。
+ * 它是**可选**的——设备不提供时整条链路照常工作，只是诊断少一项（[CalibrationMath]）。
  */
 class SensorRepository(private val context: Context) {
 
@@ -83,6 +87,7 @@ class SensorRepository(private val context: Context) {
         var lastOrientationValues: FloatArray? = null
         var lastAccelValues: FloatArray? = null
         var lastMagValues: FloatArray? = null
+        var lastMagBias: MagneticBias? = null
         var lastMagAccuracy = SENSOR_STATUS_UNRELIABLE
 
         val rotationMatrix = FloatArray(9)
@@ -127,6 +132,7 @@ class SensorRepository(private val context: Context) {
                     magZ = mag[2],
                     accuracy = lastMagAccuracy,
                     timestampNanos = System.nanoTime(),
+                    bias = lastMagBias,
                 )
             )
         }
@@ -142,7 +148,28 @@ class SensorRepository(private val context: Context) {
 
                     Sensor.TYPE_MAGNETIC_FIELD -> {
                         lastMagValues = event.values.copyOf()
-                        if (event.accuracy > lastMagAccuracy) lastMagAccuracy = event.accuracy
+                        // **赋值，不是「取较大者」。**
+                        // 这里原先是 `if (event.accuracy > lastMagAccuracy)`，那维护的是
+                        // 「历史最好精度」：一旦升到 HIGH 就再也降不下来，
+                        // 于是把手机贴到磁铁、钢门、电梯上，徽标仍然是绿的——
+                        // 而「磁场异常」这个提示存在的全部意义就是那一刻。
+                        // 精度是**状态**不是**成就**，两个写者（这里与 onAccuracyChanged）
+                        // 必须同义，否则这个字段既不是「当前」也不是「最好」，
+                        // 而是两者的混合，谁也说不清它代表什么。
+                        lastMagAccuracy = event.accuracy
+                    }
+
+                    Sensor.TYPE_MAGNETIC_FIELD_UNCALIBRATED -> {
+                        // values[0..2] 是未校准的磁场本身，values[3..5] 才是硬磁偏置估计。
+                        // 长度检查不是多余的：这是厂商 HAL 分叉最厉害的一处，
+                        // 而越界会让整个主页崩掉——诊断信息不值得拿主流程去换。
+                        if (event.values.size >= 6) {
+                            lastMagBias = MagneticBias(
+                                x = event.values[3],
+                                y = event.values[4],
+                                z = event.values[5],
+                            )
+                        }
                     }
                 }
                 emitIfReady()
@@ -150,9 +177,14 @@ class SensorRepository(private val context: Context) {
 
             override fun onAccuracyChanged(sensor: Sensor, accuracy: Int) {
                 // 磁力计精度决定「建议校准 / 请做 8 字校准」提示，只有它需要跟踪。
+                // 未校准磁力计的精度不参与判断：校准质量由偏置占比给出，那是另一个问题。
                 if (sensor.type == Sensor.TYPE_MAGNETIC_FIELD) lastMagAccuracy = accuracy
             }
         }
+
+        // 未校准磁力计是**可选**的：没有它只是诊断少一项，罗盘照常工作。
+        // 因此它是 `null || 注册成功` 里的一项，而不是让整条链路失败。
+        val uncalibratedSensor = manager.getDefaultSensor(Sensor.TYPE_MAGNETIC_FIELD_UNCALIBRATED)
 
         val handler = Handler(Looper.getMainLooper())
         val registered = manager.registerListener(
@@ -165,7 +197,12 @@ class SensorRepository(private val context: Context) {
             orientationSensor,
             SensorManager.SENSOR_DELAY_GAME,
             handler,
-        )
+        ) && (uncalibratedSensor == null || manager.registerListener(
+            listener,
+            uncalibratedSensor,
+            SensorManager.SENSOR_DELAY_GAME,
+            handler,
+        ))
 
         if (!registered) {
             manager.unregisterListener(listener)

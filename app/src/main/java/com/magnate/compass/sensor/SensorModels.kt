@@ -1,5 +1,24 @@
 package com.magnate.compass.sensor
 
+import kotlin.math.sqrt
+
+/**
+ * 未校准磁力计给出的**硬磁偏置估计**（μT），即 `TYPE_MAGNETIC_FIELD_UNCALIBRATED`
+ * 的 `values[3..5]`。
+ *
+ * **它不是磁场，是「系统从磁场里减掉了多少」。** 校准后的 `TYPE_MAGNETIC_FIELD`
+ * 等于未校准值减去这个偏置，所以拿它去判「附近有没有铁」是错的（那个问题要问校准后的强度），
+ * 它唯一能回答的是「这次校准本身把多少东西当成了固定偏差」——
+ * 偏置越大，说明手机周围有一块跟着手机一起转的磁铁，而那样的东西只能靠取下来解决。
+ *
+ * 做成不可变值类型而不是沿用 `FloatArray`：`SensorEvent.values` 是系统复用的数组，
+ * 传引用出去迟早会有人忘掉拷贝（design.md §2.2）。
+ */
+data class MagneticBias(val x: Float, val y: Float, val z: Float) {
+    val magnitude: Float
+        get() = sqrt(x * x + y * y + z * z)
+}
+
 /**
  * 一帧原始传感器读数。
  *
@@ -17,6 +36,8 @@ data class RawSensorData(
     /** `SensorEvent.accuracy`，见 [accuracyLevelOf] */
     val accuracy: Int,
     val timestampNanos: Long,
+    /** 硬磁偏置估计；设备没有未校准磁力计时为 null。见 [MagneticBias] */
+    val bias: MagneticBias? = null,
 )
 
 enum class AccuracyLevel {

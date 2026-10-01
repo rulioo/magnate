@@ -20,6 +20,10 @@ import com.magnate.compass.location.GeoPoint
 import com.magnate.compass.location.LocationProvider
 import com.magnate.compass.location.LocationResult
 import com.magnate.compass.sensor.AccuracyLevel
+import com.magnate.compass.sensor.CalibrationCause
+import com.magnate.compass.sensor.CalibrationMath
+import com.magnate.compass.sensor.CalibrationMessages
+import com.magnate.compass.sensor.CalibrationQuality
 import com.magnate.compass.sensor.CompassMath
 import com.magnate.compass.sensor.SensorRepository
 import com.magnate.compass.sensor.SensorSource
@@ -29,6 +33,7 @@ import kotlinx.coroutines.Job
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.SharingStarted
 import kotlinx.coroutines.flow.StateFlow
+import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.flow.catch
 import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.flow.combine
@@ -54,6 +59,8 @@ data class CompassUiState(
     val rollDeg: Float = 0f,
     val accuracy: AccuracyLevel = AccuracyLevel.UNKNOWN,
     val source: SensorSource? = null,
+    /** 校准质量的成因判断，见 [CalibrationMath]。默认 OK = 还没有读数，因此也没话说。 */
+    val quality: CalibrationQuality = CalibrationQuality(),
     val trueNorth: Boolean = false,
     val declination: Float? = null,
     val activeScene: SceneEntity? = null,
@@ -107,9 +114,31 @@ data class CompassUiState(
     val tiltWarning: Boolean
         get() = tiltDeg > CompassMath.TILT_WARNING_DEGREES
 
-    /** 低精度或不可信时引导用户做 8 字校准（design.md §5.9）。 */
+    /**
+     * 罗盘读数是否处在「需要用户做点什么」的状态（design.md §5.9）。
+     *
+     * 判据从单纯的 `accuracy` 换成了 [quality]：精度只是四种成因之一，
+     * 而「附近有磁铁」和「装了磁吸壳」都会让精度读数依然好看，
+     * 却让指向实实在在是错的。`accuracy` 仍然是其中一条判据，
+     * 只是它现在由 [CalibrationMath] 统一裁决，不再和别的信号各说各话。
+     */
     val needsCalibration: Boolean
-        get() = accuracy.needsCalibration
+        get() = quality.needsAttention
+
+    /** 主页顶部常驻提示条上的那句话；无事可报时为 null。 */
+    val calibrationBanner: String?
+        get() = CalibrationMessages.banner(quality.cause)
+
+    /** 校准面板的标题与正文，按成因分支。 */
+    val calibrationTitle: String
+        get() = CalibrationMessages.title(quality.cause)
+
+    val calibrationGuidance: String
+        get() = CalibrationMessages.guidance(quality.cause)
+
+    /** 来源降级说明；用旋转矢量时为 null。 */
+    val calibrationSourceNote: String?
+        get() = CalibrationMessages.sourceNote(source)
 }
 
 /**
@@ -154,6 +183,14 @@ class CompassViewModel(
     /** 磁偏角按坐标缓存，避免每帧都构造 [GeomagneticField]（它内部要展开球谐级数）。 */
     private var declinationCache: Pair<GeoPoint, Float>? = null
 
+    /**
+     * 上一帧的校准成因，喂给 [CalibrationMath.assessCalibration] 做迟滞。
+     *
+     * 必须**跨帧保存**，与滤波状态同理：磁场是连续量，会一直在阈值上下漂，
+     * 每一帧都当作首次判断的话，提示条会一闪一闪。
+     */
+    private var lastCalibrationCause: CalibrationCause? = null
+
     val uiState: StateFlow<CompassUiState> =
         combine(
             _sensor,
@@ -176,6 +213,7 @@ class CompassViewModel(
                 rollDeg = sensor.rollDeg,
                 accuracy = sensor.accuracy,
                 source = sensor.source,
+                quality = sensor.quality,
                 trueNorth = trueNorth,
                 declination = declination,
                 activeScene = scene,
@@ -268,6 +306,18 @@ class CompassViewModel(
                     smoothedPitchDeg = smoothedPitch
                     smoothedRollDeg = smoothedRoll
 
+                    // 判定用的是**滤波后**的强度，与屏幕上显示的是同一个数。
+                    // 拿原始值判会导致「读数看着正常、提示条却说有干扰」，
+                    // 这类自相矛盾在本项目里已经出现过一次（倾角提示），不能再犯。
+                    val accuracy = accuracyLevelOf(raw.accuracy)
+                    val quality = CalibrationMath.assessCalibration(
+                        bias = raw.bias,
+                        magnitudeUt = smoothedMag,
+                        accuracy = accuracy,
+                        previousCause = lastCalibrationCause,
+                    )
+                    lastCalibrationCause = quality.cause
+
                     _sensor.value = SensorSnapshot(
                         azimuthDeg = smoothedAz,
                         magnitudeUt = smoothedMag,
@@ -281,8 +331,9 @@ class CompassViewModel(
                         // 不这么做的话，手机接近倒置时详情页会出现 181.4° 这种数。
                         pitchDeg = CompassMath.normalizeSignedDegrees(smoothedPitch),
                         rollDeg = CompassMath.normalizeSignedDegrees(smoothedRoll),
-                        accuracy = accuracyLevelOf(raw.accuracy),
+                        accuracy = accuracy,
                         source = sensorRepository.resolveSource(),
+                        quality = quality,
                     )
                 }
         }
@@ -293,6 +344,31 @@ class CompassViewModel(
         sensorJob?.cancel()
         sensorJob = null
         locationProvider.stopTracking()
+    }
+
+    // ————————————————————— 校准 —————————————————————
+
+    private val _calibrationMode = MutableStateFlow(false)
+
+    /**
+     * 是否处于校准模式。
+     *
+     * **不是一条独立路由，而是主页上的一种模式**——`design-gui.md:877` 已经写明
+     * 「校准中 → 顶部提示条 + 表盘降为 50% 透明度」，表盘必须仍然可见。
+     * 这也正是校准与「看卫星」的区别：卫星页是一个可以离开的地方，
+     * 而校准要求用户一边画 8 字一边看着读数回升，那两件事必须同屏。
+     *
+     * 单独一个 StateFlow 而不并进 [uiState]：`uiState` 已经由五路 `combine` 构成，
+     * 再加一路要换成数组重载并丢掉类型，代价大于收益，而这两份状态本来也不同源。
+     */
+    val calibrationMode: StateFlow<Boolean> = _calibrationMode.asStateFlow()
+
+    fun startCalibration() {
+        _calibrationMode.value = true
+    }
+
+    fun finishCalibration() {
+        _calibrationMode.value = false
     }
 
     // ————————————————————— 交互 —————————————————————
@@ -426,6 +502,7 @@ class CompassViewModel(
         val rollDeg: Float = 0f,
         val accuracy: AccuracyLevel = AccuracyLevel.UNKNOWN,
         val source: SensorSource? = null,
+        val quality: CalibrationQuality = CalibrationQuality(),
     )
 
     private companion object {
