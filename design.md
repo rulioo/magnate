@@ -2,10 +2,14 @@
 
 > 一个基于手机内置传感器的安卓应用：实时测量**方位角**与**磁场大小**，以**场景**为单位组织采样数据，记录坐标、保存测量值、打标签、检索回溯。
 
-- 版本：v1.2（设计稿）
-- 日期：2026-09-24
+- 版本：v1.4（v1.2 设计稿 + 至 v1.4 的实现修订）
+- 日期：2026-10-01
 - 需求来源：`req.txt`
 - 配套文档：界面设计见 [`design-gui.md`](./design-gui.md)
+
+> **文档与实现的关系**：本文既是设计依据，也随实现回填。凡标注「（v1.x）」的小节都是该版本实现后补写的，
+> 记录的是**当时为什么这么做**，而不只是做了什么——多数条目对应一次真实踩坑（§5.9 的两个判据、
+> §7 的权限策略改写、§9.1 的两处耗电修订）。改动代码时若与本文件冲突，**以代码为准并回来改这里**。
 
 ---
 
@@ -61,11 +65,11 @@ R11 描述的是一个**典型的实地工作流**：
 | 同时归属 | **至多一个**（当前场景） | 可多个 |
 | 主要用途 | 数据归属与空间聚合 | 横向检索与标注 |
 
-### 1.4 非目标（v1.0–v1.2 不做，列入 Roadmap）
+### 1.4 非目标（至 v1.4 仍不做，列入 Roadmap）
 
 - 数据导出（CSV / GeoJSON / KML）
 - 地图视图与磁场热力图
-- 硬磁/软磁椭球拟合校准
+- 硬磁/软磁椭球拟合校准（v1.4 只做**引导与诊断**，见 §5.9 末段）
 - 云端同步、多设备协作
 - 场景嵌套（场景下的子区域）
 - 后台常驻采集
@@ -191,7 +195,15 @@ data class RawSensorData(
     val azimuthRad: Float, val pitchRad: Float, val rollRad: Float,
     val magX: Float, val magY: Float, val magZ: Float,
     val accuracy: Int, val timestampNanos: Long,
+    /** 硬磁偏置估计；设备没有未校准磁力计时为 null（§5.9） */
+    val bias: MagneticBias? = null,
 )
+
+/** 未校准磁力计 values[3..5]。做成值类型而不是沿用 FloatArray：
+ *  SensorEvent.values 是系统复用的数组，传引用出去迟早有人忘掉拷贝（§2.2）。 */
+data class MagneticBias(val x: Float, val y: Float, val z: Float) {
+    val magnitude: Float get() = sqrt(x * x + y * y + z * z)
+}
 
 data class CompassUiState(
     val azimuthDeg: Float = 0f,
@@ -200,17 +212,34 @@ data class CompassUiState(
     val magX: Float = 0f, val magY: Float = 0f, val magZ: Float = 0f,
     val pitchDeg: Float = 0f, val rollDeg: Float = 0f,
     val accuracy: AccuracyLevel = AccuracyLevel.UNKNOWN,
-    val source: SensorSource = SensorSource.ROTATION_VECTOR,
+    val source: SensorSource? = null,          // null = 尚无可用来源
+    val quality: CalibrationQuality = CalibrationQuality(),   // §5.9
     val trueNorth: Boolean = false,
     val declination: Float? = null,
     val activeScene: SceneEntity? = null,      // 当前场景（R11）
     val locationPreview: EffectiveLocation = EffectiveLocation.None,  // 实时预览
-    val error: String? = null,
-)
+    val lastKnownLocation: GeoPoint? = null,   // 「磁偏角能不能算」的判据（§5.7）
+    val locationPermission: LocationPermissionLevel = LocationPermissionLevel.NONE,
+    val sensorAvailable: Boolean = true,
+) {
+    /** 倾角：相对水平面的夹角，由 pitch/roll 合成 */
+    val tiltDeg: Float get() = CompassMath.tiltFromHorizontal(pitchDeg, rollDeg)
+}
 
 enum class AccuracyLevel { HIGH, MEDIUM, LOW, UNRELIABLE, UNKNOWN }
 enum class SensorSource { ROTATION_VECTOR, GEOMAGNETIC_ROTATION_VECTOR, ACCEL_MAG }
 ```
+
+**`error: String?` 已被 `sensorAvailable: Boolean` 取代**（v1.2 实现期）。原来那个字段只能表达「出错了」，
+而 UI 真正要区分的是**「这台设备根本没有磁力计」**——那要显示整页空状态，且记录/场景功能必须保留（§6）。
+一个可空字符串既装不下这个语义，也容易被后来者当成通用的错误通道塞进别的消息。
+
+#### 倾角的符号约定（文档此前从未写明，以代码为准）
+
+`pitchDeg` / `rollDeg` 直接取自 `SensorManager.getOrientation`，因此遵循 AOSP 的实际行为：
+**平放时 pitch = 0°，竖持时 pitch = −90°**——与「平放 = −90°」的直觉相反。倾角（设备平面相对水平面的夹角）
+由 `CompassMath.tiltFromHorizontal(pitchDeg, rollDeg)` 换算，水平仪气泡的位移由 `CompassMath.bubbleOffset`
+给出（用 `sin(倾角)` 映射，与容差环的几何等价）。这两个函数是纯函数且有单测，**约定以它们的 KDoc 为准**。
 
 ### 5.3 坐标模型
 
@@ -877,7 +906,8 @@ suspend fun saveRecordWithTags(
 
 本节只保留与架构相关的界面约束：
 
-- **七个页面**：主页 `CompassScreen`、记录列表、记录详情、搜索、标签管理、**场景列表 `SceneListScreen`**、**场景详情 `SceneDetailScreen`**。Navigation Compose 组织，主页为起始目的地；
+- **八个页面**：主页 `CompassScreen`、记录列表、记录详情、搜索、标签管理、场景列表 `SceneListScreen`、场景详情 `SceneDetailScreen`、**卫星信号 `SatelliteScreen`（v1.3）**。Navigation Compose 组织，主页为起始目的地。
+  **校准不是页面**——它是主页上的一种模式（§5.9）。用户要一边画 8 字一边看读数回升，两件事必须同屏，独立路由会把表盘推走；
 - 界面仅依赖 Jetpack Compose + Navigation，**不引入非 AndroidX 的第三方 UI 库**。罗盘与 8 字校准动画均手绘；
 - 表盘**双层结构**：刻度与方位字为一层（旋转 `-azimuthDeg`），指针与中心点为另一层（静止）；
 - 表盘旋转用 **Linear 缓动**，EaseOut 会让指针停止时过冲回弹，被误读为仪器不准；
@@ -937,12 +967,19 @@ magnate/
 │       │   │   ├── MainActivity.kt
 │       │   │   ├── di/AppContainer.kt
 │       │   │   ├── sensor/
-│       │   │   │   ├── SensorRepository.kt
-│       │   │   │   ├── SensorModels.kt
-│       │   │   │   └── CompassMath.kt            # 纯函数
+│       │   │   │   ├── SensorRepository.kt       # 注册/注销、A→B→C 降级链
+│       │   │   │   ├── SensorModels.kt           # RawSensorData / MagneticBias / 枚举
+│       │   │   │   ├── CalibrationMath.kt        # 校准成因判定（纯函数）★
+│       │   │   │   ├── CalibrationMessages.kt    # 校准文案（纯函数）
+│       │   │   │   └── CompassMath.kt            # 罗盘数学（纯函数）
 │       │   │   ├── location/
-│       │   │   │   ├── LocationProvider.kt
-│       │   │   │   └── GeoPoint.kt
+│       │   │   │   ├── LocationProvider.kt       # 缓存预热 + 按需定位
+│       │   │   │   ├── LocationResult.kt         # 四态结果，刻意不含「永久拒绝」
+│       │   │   │   ├── LastKnown.kt              # 多 provider 系统缓存择优（纯函数）
+│       │   │   │   ├── GeoPoint.kt
+│       │   │   │   ├── GnssProvider.kt           # 卫星流（冷流，自带保活请求）
+│       │   │   │   ├── GnssModels.kt             # 星座 / 卫星 / 受阻原因
+│       │   │   │   └── GnssFormat.kt             # C/N0 分档与格式化（纯函数）
 │       │   │   ├── data/
 │       │   │   │   ├── db/
 │       │   │   │   │   ├── MagnateDatabase.kt
@@ -952,68 +989,110 @@ magnate/
 │       │   │   │   │   └── Migrations.kt
 │       │   │   │   ├── entity/
 │       │   │   │   │   ├── RecordEntity.kt
-│       │   │   │   │   ├── TagEntity.kt
-│       │   │   │   │   ├── SceneEntity.kt        # 含 CoordMode
-│       │   │   │   │   └── RecordTagCrossRef.kt
+│       │   │   │   │   ├── TagEntity.kt          # 同文件内还有 RecordTagCrossRef
+│       │   │   │   │   └── SceneEntity.kt        # 含 CoordMode
 │       │   │   │   ├── RecordWithRelations.kt    # @Relation 聚合
 │       │   │   │   ├── LocationResolver.kt       # resolveLocation 纯函数 ★
-│       │   │   │   ├── RecordFilter.kt
+│       │   │   │   ├── RecordFilter.kt           # SQL 侧筛选条件
+│       │   │   │   ├── SearchCriteria.kt         # 用户意图 → RecordFilter（纯函数）
 │       │   │   │   ├── RecordQueryBuilder.kt     # 动态 SQL 构造（纯函数）★
+│       │   │   │   ├── RecordDraft.kt            # 冻结快照与保存请求
 │       │   │   │   ├── RecordRepository.kt       # 唯一写入入口
 │       │   │   │   ├── SceneRepository.kt
-│       │   │   │   └── ActiveSceneStore.kt       # DataStore 封装
+│       │   │   │   ├── TagRepository.kt
+│       │   │   │   ├── ActiveSceneStore.kt       # DataStore：当前激活场景
+│       │   │   │   └── SettingsStore.kt          # DataStore：真北开关、权限已申请标记
 │       │   │   ├── ui/
-│       │   │   │   ├── nav/MagnateNavHost.kt
+│       │   │   │   ├── MagnateAppRoot.kt         # 根节点：权限门 + 保存 Snackbar
+│       │   │   │   ├── AppViewModelProvider.kt   # 手写 ViewModel 工厂（8 个）
+│       │   │   │   ├── nav/
+│       │   │   │   │   ├── MagnateNavHost.kt
+│       │   │   │   │   └── Routes.kt             # 路由常量，无底部导航栏
 │       │   │   │   ├── compass/
 │       │   │   │   │   ├── CompassScreen.kt
 │       │   │   │   │   ├── CompassViewModel.kt
 │       │   │   │   │   ├── CompassDial.kt
 │       │   │   │   │   ├── MagneticFieldCard.kt
+│       │   │   │   │   ├── TiltCard.kt           # 倾角卡片 + 水平仪气泡
 │       │   │   │   │   ├── SceneBar.kt           # 场景条 ★
-│       │   │   │   │   └── SaveRecordSheet.kt
+│       │   │   │   │   ├── SaveRecordSheet.kt
+│       │   │   │   │   └── CalibrationPanel.kt   # 校准模式面板 ★（§5.9）
 │       │   │   │   ├── records/
 │       │   │   │   │   ├── RecordListScreen.kt
 │       │   │   │   │   ├── RecordListItem.kt
+│       │   │   │   │   ├── RecordListEntries.kt  # 按日历日分组（纯函数）
 │       │   │   │   │   ├── RecordDetailScreen.kt
-│       │   │   │   │   └── RecordsViewModel.kt
+│       │   │   │   │   ├── RecordsViewModel.kt
+│       │   │   │   │   ├── RecordDetailViewModel.kt
+│       │   │   │   │   ├── MiniCompass.kt        # 详情页静态迷你罗盘
+│       │   │   │   │   └── RecordTextFormat.kt   # 「复制为文本」（纯函数）
 │       │   │   │   ├── scenes/
 │       │   │   │   │   ├── SceneListScreen.kt
 │       │   │   │   │   ├── SceneDetailScreen.kt
 │       │   │   │   │   ├── SceneEditSheet.kt
 │       │   │   │   │   ├── ScenePickerSheet.kt   # 主页快速切换
-│       │   │   │   │   └── SceneViewModel.kt
+│       │   │   │   │   ├── SceneViewModel.kt
+│       │   │   │   │   └── SceneDetailViewModel.kt
 │       │   │   │   ├── search/
 │       │   │   │   │   ├── SearchScreen.kt
 │       │   │   │   │   ├── FilterSheet.kt
 │       │   │   │   │   └── SearchViewModel.kt
 │       │   │   │   ├── tags/
+│       │   │   │   │   ├── TagManageScreen.kt
+│       │   │   │   │   └── TagViewModel.kt
+│       │   │   │   ├── satellite/                # 卫星信号页（v1.3）
+│       │   │   │   │   ├── SatelliteScreen.kt
+│       │   │   │   │   └── SatelliteViewModel.kt
 │       │   │   │   ├── common/
+│       │   │   │   │   ├── Banner.kt             # 提示条，主页与卫星页共用
+│       │   │   │   │   ├── Badges.kt             # AccuracyBadge / TagChip / Pill
+│       │   │   │   │   ├── EmptyState.kt
+│       │   │   │   │   ├── FlashHighlight.kt     # 「值变了闪一次」
+│       │   │   │   │   ├── LevelBubble.kt        # 水平仪气泡（Canvas）
+│       │   │   │   │   ├── LocationAcquire.kt    # 取坐标 + 权限兜底
 │       │   │   │   │   ├── LocationBadge.kt      # 坐标来源徽标 ★
-│       │   │   │   │   ├── AccuracyBadge.kt
-│       │   │   │   │   └── EmptyState.kt
+│       │   │   │   │   ├── LocationPermissionGate.kt  # 应用级权限门（v1.3）
+│       │   │   │   │   ├── MagnateIcons.kt       # 自绘图标（10 个）
+│       │   │   │   │   ├── MagneticBar.kt        # 强度条 + 三分量行
+│       │   │   │   │   └── MapIntent.kt          # geo: 意图
 │       │   │   │   └── theme/
 │       │   │   └── util/
-│       │   │       ├── PermissionHelper.kt
+│       │   │       ├── PermissionHelper.kt       # 权限分档（纯函数）
+│       │   │       ├── LocationMessages.kt       # 定位失败文案（纯函数）
 │       │   │       ├── TimeFormat.kt
 │       │   │       └── GeoFormat.kt              # 坐标/精度格式化（纯函数）
 │       │   └── res/
-│       ├── test/java/com/magnate/compass/
-│       │   ├── CompassMathTest.kt                # 纯 JVM
-│       │   ├── LocationResolverTest.kt           # ★ 8 种组合全覆盖
-│       │   ├── RecordQueryBuilderTest.kt         # ★ 含"有坐标"筛选与场景交集
-│       │   └── GeoFormatTest.kt
-│       └── androidTest/java/com/magnate/compass/
+│       ├── testFixtures/java/com/magnate/compass/
+│       │   └── TestFixtures.kt                   # record/scene 构造器与固定时区，两源集共用
+│       ├── test/java/com/magnate/compass/        # 纯 JVM，14 文件 / 257 用例
+│       │   ├── sensor/CompassMathTest.kt                     # 36
+│       │   ├── sensor/CalibrationMathTest.kt                 # 21 ★ 成因分档与迟滞方向
+│       │   ├── sensor/CalibrationMessagesTest.kt             # 12 ★ 磁吸配件不得劝人画 8 字
+│       │   ├── data/LocationResolverTest.kt                  # 28 ★ §5.6 矩阵全覆盖
+│       │   ├── data/RecordQueryBuilderTest.kt                # 31 ★「有坐标」筛选与场景交集
+│       │   ├── data/SearchCriteriaTest.kt                    # 28 ★ 筛选意图 → SQL 条件
+│       │   ├── location/GnssFormatTest.kt                    # 27 ★ 缺失必须落到最差档
+│       │   ├── location/LastKnownTest.kt                     # 7  ★ time=0 与未来时间戳
+│       │   ├── util/GeoFormatTest.kt                         # 19
+│       │   ├── util/TimeFormatTest.kt                        # 12
+│       │   ├── util/LocationMessagesTest.kt                  # 8  ★ 按原因给不同文案
+│       │   ├── util/LocationPermissionTest.kt                # 7  ★ FINE / COARSE_ONLY 分档
+│       │   ├── ui/records/GroupRecordsByDayTest.kt           # 9
+│       │   └── ui/records/RecordTextFormatTest.kt            # 12
+│       └── androidTest/java/com/magnate/compass/data/db/
+│           ├── DatabaseSchemaTest.kt             # ★ 直接读 PRAGMA 守外键与索引
 │           ├── RecordDaoTest.kt
-│           ├── SceneDaoTest.kt                   # ★ SET_NULL 级联行为
-│           └── MigrationTest.kt
+│           └── SceneDaoTest.kt                   # ★ SET_NULL 级联行为
 ├── design.md
 ├── design-gui.md
 └── req.txt
 ```
 
-**可测性设计**：`CompassMath`、`LocationResolver`、`RecordQueryBuilder`、`GeoFormat`、`TimeFormat` 全部为**纯函数**，不依赖 `Context` 或 Android 类，可在 JVM 上直接单测。
+**可测性设计**：`sensor/` 的 `CompassMath` 与 `CalibrationMath`、`data/` 的 `LocationResolver` / `RecordQueryBuilder` / `SearchCriteria`、`location/` 的 `LastKnown` 与 `GnssFormat`、`util/` 的 `GeoFormat` / `TimeFormat` / `PermissionHelper` / `LocationMessages`、`ui/records/` 的 `RecordListEntries` 与 `RecordTextFormat` 全部为**纯函数**，不依赖 `Context` 或 Android 类，可在 JVM 上直接单测。这也是 `SensorModels.kt` 里**重新声明** `SENSOR_STATUS_*` 常量而不 import `SensorManager` 的原因——一旦 import，整个 `CompassMath` 就只能进 `androidTest`。
 
-其中 `LocationResolver` 与 `RecordQueryBuilder` 是最需要测试的两个模块——它们是坐标语义的 Kotlin 侧实现与 SQL 侧实现，**必须由同一组用例交叉验证两者结论一致**。
+其中 `LocationResolver` 与 `RecordQueryBuilder` 是最需要测试的两个模块——它们是坐标语义的 Kotlin 侧实现与 SQL 侧实现，**必须由同一组用例交叉验证两者结论一致**。同理，`CalibrationMath` 与 `CalibrationMessages` 是「判得准不准」与「说得对不对」的分工，`CalibrationMessagesTest` 里那条「磁吸配件不得建议画 8 字」护的正是后者。
+
+> **`androidTest` 至今没有真正跑过。** 它会被 `assembleDebugAndroidTest` 编译成 APK，但开发机上既没有连接设备也没有模拟器镜像，因此这三组测试只证明了「能编译」，**没有证明过任何一条断言通过**。凡涉及真实 SQLite 行为（外键级联、PRAGMA、动态 SQL）与真机表现（传感器手性、排版）的结论，都还没有被眼睛验证过——交付时须如实说明。
 
 ---
 
@@ -1085,14 +1164,24 @@ LifecycleResumeEffect(Unit) {
 
 | 层级 | 内容 |
 | --- | --- |
-| **单元测试（JVM）** | `CompassMathTest`：角度归一化、最短弧滤波（**359°→1° 与 1°→359° 双向边界**）、磁场模长、方向名称 22.5° 分界、**四种屏幕 rotation 重映射** |
-| | `LocationResolverTest`：**§5.6 矩阵的全部 7 种组合**；尤其「FOLLOW + 有实测」必须返回 `Measured` 而非 `FromScene`；`locationAccuracy` 缺失时必须是 `MAX_VALUE` 而非 0 |
-| | `RecordQueryBuilderTest`：每种筛选单独验证；标签 AND/OR；场景交集；**「有坐标」筛选必须覆盖场景继承情形**（记录自身无坐标但场景有 → 应命中）；关键词特殊字符（`%` `_` `'`）不破坏 SQL；排序白名单 |
-| | `GeoFormatTest`：坐标格式化（含南纬/西经负值）、定位精度分档 |
-| **仪器测试** | `SceneDaoTest`：**删除场景后记录仍存在且 `sceneId` 为 null**（SET_NULL 行为）；场景重名冲突；`recordCount` 子查询正确性 |
+| **单元测试（JVM，14 文件 / 257 用例）** | `CompassMathTest`(36)：角度归一化、最短弧滤波（**359°→1° 与 1°→359° 双向边界**）、磁场模长、方向名称 22.5° 分界、**四种屏幕 rotation 重映射**、倾角换算与气泡位移 |
+| | `CalibrationMathTest`(21)：四种成因各自的判据；**迟滞只收紧正在抱怨的那一条**（两条同时收紧会让纯偏置问题被改判成环境干扰，从此再也退不出来）；NaN / 0 磁场必须落到最差档；阈值取闭区间 |
+| | `CalibrationMessagesTest`(12)：各成因文案互不相同；**磁吸配件那条不得出现「8 字」**（给错办法等于让用户白折腾十几遍）；恒定偏差的说明须点名磁偏角 |
+| | `LocationResolverTest`(28)：**§5.6 矩阵的全部组合**；尤其「FOLLOW + 有实测」必须返回 `Measured` 而非 `FromScene`；`locationAccuracy` 缺失时必须是 `MAX_VALUE` 而非 0 |
+| | `RecordQueryBuilderTest`(31)：每种筛选单独验证；标签 AND/OR；场景交集；**「有坐标」筛选必须覆盖场景继承情形**（记录自身无坐标但场景有 → 应命中）；关键词特殊字符（`%` `_` `'`）不破坏 SQL；排序白名单 |
+| | `SearchCriteriaTest`(28)：预设（今天 / 近 7 天 / 25–65μT）换算成 `RecordFilter` 的边界与开闭区间 |
+| | `GnssFormatTest`(27)：C/N0 四档分界；**缺失必须落到最差档而非最好**；排序必须是全序（单测钉的是「C/N0 相同时顺序稳定」——否则条目在帧间互换位置，而列表按 `key` 复用条目，画面会抖） |
+| | `LastKnownTest`(7)：滤掉 `time = 0` 与未来时间戳；同一时间取精度更好者 |
+| | `GeoFormatTest`(19)：坐标格式化（含南纬/西经负值）、定位精度分档、海拔基准的措辞 |
+| | `TimeFormatTest`(12)、`GroupRecordsByDayTest`(9)：固定时区下的日期分组与「今天 / 昨天」 |
+| | `LocationMessagesTest`(8)、`LocationPermissionTest`(7)：四种失败结果各给不同文案；仅永久拒绝才挂「去设置」；FINE 与 COARSE_ONLY 的分档 |
+| | `RecordTextFormatTest`(12)：「复制为文本」必须写出坐标**来源**，不得只给一个光秃秃的经纬度 |
+| **仪器测试（已编译，从未运行）** | `DatabaseSchemaTest`：直接读 PRAGMA 断言**声明本身**——外键开关、`records.sceneId` 为 `SET NULL`、`record_tags` 两键 `CASCADE`、唯一索引、四个索引、`db.version == 1` 且 `MIGRATIONS` 为空 |
+| | `SceneDaoTest`：**删除场景后记录仍存在且 `sceneId` 为 null**（SET_NULL 行为）；场景重名冲突；`recordCount` 子查询正确性 |
 | | `RecordDaoTest`：标签 AND 查询、唯一索引冲突复用、标签 CASCADE 删除、事务原子性（插入中途失败不留半条记录） |
-| | `MigrationTest`：`MigrationTestHelper` 验证迁移后数据完整 |
-| **手动测试** | 真机对照实体指南针（误差 < 5°）；靠近磁铁验证干扰告警；旋转屏幕验证方位角不偏移；**完整走一遍"户外取坐标 → 建场景 → 室内连测 10 点 → 验证 10 条记录坐标一致且标注为场景来源"** |
+| **手动测试** | 真机对照实体指南针（误差 < 5°）；**把手机贴到磁铁上，确认徽标立刻从绿变黄**（v1.4 的承重假设，本机无法验证）；装上磁吸壳，确认提示条说的是「取下配件」而不是「画 8 字」；旋转屏幕验证方位角不偏移；**完整走一遍"户外取坐标 → 建场景 → 室内连测 10 点 → 验证 10 条记录坐标一致且标注为场景来源"** |
+
+> `DatabaseSchemaTest` 目前兼着 schema 护栏的职责，因为它断言的是**声明**（外键动作、索引），而库还是 v1、`MIGRATIONS` 是空数组（`data/db/Migrations.kt`），没有迁移可测。**一旦 `MIGRATIONS` 非空，必须补上 `MigrationTest`**——那正是 `exportSchema = true` 与 `MigrationTestHelper` 存在的理由，也是「禁止破坏性迁移」这条约束唯一能被自动验证的地方。
 
 **验收标准**：
 
@@ -1117,8 +1206,10 @@ LifecycleResumeEffect(Unit) {
 
 | 风险 | 影响 | 对策 |
 | --- | --- | --- |
-| 手机内部磁性元件零点偏移 | 方位角系统性偏差 | 引导 8 字校准；文档说明手机壳磁扣是常见干扰源 |
+| 手机内部磁性元件零点偏移 | 方位角系统性偏差 | 引导 8 字校准（§5.9）；文档说明手机壳磁扣是常见干扰源 |
 | 靠近铁磁性物体 | 读数失真 | 范围检测 + 干扰告警 |
+| **磁吸配件被误当成校准问题** | 用户反复画 8 字永不生效，结论落在「这应用不准」 | **v1.4 的核心修正**：强度异常**且**硬磁偏置同时超标时判为配件，文案直接说「取下配件」而非「画 8 字」；单测钉住这一条（§5.9、§11） |
+| **恒定偏差被误当成校准问题** | 用户朝错误方向使劲 | 校准面板固定说明那是磁偏角（磁北 vs 真北），指向真北开关（§5.9） |
 | 厂商传感器实现差异大 | 部分机型表现异常 | 降级链 + 真机覆盖（至少 3 个品牌） |
 | **国产 ROM 无 GMS** | 若依赖 Fused API 则定位全废 | **已规避**：使用系统 `LocationManager`（§3.1） |
 | **室内采样拿不到 GPS** | 记录缺坐标 | **场景机制根本性缓解**（§1.3）；另有缓存预热 + 超时降级 + 补录 |
@@ -1133,16 +1224,20 @@ LifecycleResumeEffect(Unit) {
 
 ## 13. Roadmap
 
-| 版本 | 内容 |
-| --- | --- |
-| v1.0 | 方位角 + 磁场实时显示、罗盘表盘、精度提示、真北可选 |
-| v1.1 | 采样点坐标、记录保存、标签、搜索与筛选 |
-| **v1.2** | **场景：坐标挂载、场景内自动归属、场景管理与切换**（本文档范围） |
-| v1.3 | 数据导出（CSV / GeoJSON）、**地图视图**（场景为点、FOLLOW 记录为轨迹） |
-| v1.4 | 椭球拟合硬磁/软磁校准（自研校准算法） |
-| v2.0 | **磁场热力图**（以场景为空间单元，场景内插值）、金属探测模式、多设备对比 |
+| 版本 | 状态 | 内容 |
+| --- | --- | --- |
+| v1.0 | 已发布 | 方位角 + 磁场实时显示、罗盘表盘、精度提示、真北可选 |
+| v1.1 | 已发布 | 采样点坐标、记录保存、标签、搜索与筛选（后来补了海拔展示与倾角） |
+| v1.2 | 已发布 | **场景：坐标挂载、场景内自动归属、场景管理与切换** |
+| v1.3 | 已发布 | **修复坐标获取**：根因是全项目从未申请过运行时权限，六条取坐标路径全部静默失败，而失败文案一律怪天气。新增应用级权限门 + **卫星信号页** |
+| v1.4 | 已发布 | **罗盘校准的诊断与引导**：精度棘轮修复、按成因分档的常驻提示条、主页内的校准模式（§5.9） |
+| —— | 计划 | 数据导出（CSV / GeoJSON）、地图视图（场景为点、FOLLOW 记录为轨迹） |
+| —— | 计划 | 椭球拟合硬磁/软磁校准（自研校准算法）——v1.4 只做了引导与诊断，算法仍在此处 |
+| —— | 计划 | 磁场热力图（以场景为空间单元，场景内插值）、金属探测模式、多设备对比 |
 
-> **场景是 v2.0 热力图的空间骨架。** 热力图需要"一个位置、多个测量值"的结构，而 FIXED 场景恰好就是这个结构——同一坐标下聚集了该位置的全部测量点。**如果热力图在规划内，场景的 `coordMode` 从 v1.2 就要实现正确**：只有 FIXED 场景才能聚合成热力点，FOLLOW 场景是散点轨迹，两者在可视化上完全不同。
+> **v1.3 与 v1.4 的号被「挪用了」**：最初规划里 v1.3 是数据导出 + 地图视图、v1.4 是椭球拟合校准。实际两次发布都是**修复 + 诊断**性质——用户报的两个问题（坐标取不到、罗盘不准）优先级更高，而它们各自暴露出比功能缺失更严重的底层缺陷（从未申请权限、精度读数被写成棘轮）。数据导出、地图视图与椭球拟合**都没有做**，仍在计划中。看历史版本号时请注意这一点。
+
+> **场景是计划中热力图的空间骨架。** 热力图需要"一个位置、多个测量值"的结构，而 FIXED 场景恰好就是这个结构——同一坐标下聚集了该位置的全部测量点。**如果热力图在规划内，场景的 `coordMode` 从 v1.2 就要实现正确**：只有 FIXED 场景才能聚合成热力点，FOLLOW 场景是散点轨迹，两者在可视化上完全不同。
 
 ---
 
